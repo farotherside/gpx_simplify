@@ -9,7 +9,9 @@ Built for a real-world use case: ten years of sailing across the Pacific, around
 ## Features
 
 - **Multi-source merge** — combines all tracks and segments from any number of sources, sorted chronologically into one unified track
+- **No-timestamp drop** — track points with no timestamp are discarded at parse time; they cannot be chronologically sorted or speed-checked and would corrupt the merged timeline if kept
 - **Speed anomaly filter** — drops points that imply physically impossible speeds or positions. For points with normal timestamps, uses a combined one-sided impossibility check and two-sided speed check. For points sharing an identical timestamp with their predecessor (a common artefact when two GPS loggers record the same instant), uses a spatial distance check against the raw predecessor: if two simultaneous points are more than one second's worth of travel apart, the second is a *ghost fix* from another source and is dropped. A second speed pass runs after decimation to catch impossible-speed steps created by centroid averaging across interleaved GPS sources.
+- **Zero-speed ghost filter** — after decimation, scans for adjacent output point pairs that are within 1 m of each other (zero apparent speed). For each such pair, examines the surrounding context points, excluding the pair itself. If the pair's position is more than a configurable distance (default 50 km) from every external neighbour, the pair is a geographically isolated ghost island — both points are dropped. Genuine stationary positions (boat at anchor, in port) are unaffected because their neighbours are within a few kilometres.
 - **Antimeridian-safe centroid averaging** — cluster centroids near the date line (±180°) are computed using circular mean, preventing GPS fixes on opposite sides of the antimeridian from averaging to a point in the wrong hemisphere
 - **Longitude-jump filter** — catches GPS hemisphere-jumps (e.g. a fix at lon=-60° while crossing the date line near lon=±179°) that the speed filter may miss due to antimeridian wrapping; runs after decimation
 - **Elevation spike filter** — drops points whose altitude differs from the previous point by more than a configurable threshold (default 50 m); GPS elevation noise on a boat should never produce sudden multi-metre jumps
@@ -65,15 +67,17 @@ python gpx_simplify.py -i voyage.gpx --no-waypoints -vvv
 | `--max-crosstrack-rate M_PER_HOUR` | `93000` | Rate guard for the cross-track filter — keeps legitimate self-crossing tracks |
 | `--passes N` | `3` | Max cross-track filter passes (stops early when nothing is dropped) |
 | `--split-gap HOURS` | `24` | Split output into separate segments at time gaps longer than this; use 0 to disable |
+| `--zerospd-window N` | `10` | Number of context points to examine on each side when evaluating a zero-speed step |
+| `--zerospd-max-dist KM` | `50` | Distance threshold (km) beyond which a zero-speed pair is treated as a ghost island and dropped |
 | `--waypoints / --no-waypoints` | waypoints on | Copy waypoints to output |
 | `-v / -vv / -vvv` | quiet | Verbosity: info / debug / trace |
 | `--dry-run` | off | Parse and filter but do not write output |
 
 ## How it works
 
-**1. Parse** — reads the input GPX with [gpxpy](https://github.com/tkrajina/gpxpy), collecting every track point with its timestamp and source label.
+**1. Parse** — reads the input GPX with [gpxpy](https://github.com/tkrajina/gpxpy), collecting every track point with its timestamp and source label. Points with no timestamp are discarded immediately: they cannot be sorted chronologically or speed-checked, and keeping them would corrupt the merged timeline.
 
-**2. Sort** — merges all points from all tracks and segments into a single chronological list (points without timestamps are appended at the end).
+**2. Sort** — merges all timestamped points from all tracks and segments into a single chronological list.
 
 **3. Speed filter** — walks the sorted list and drops GPS anomalies in two ways:
 
@@ -96,7 +100,9 @@ python gpx_simplify.py -i voyage.gpx --no-waypoints -vvv
 
 **10. Deduplicate positions** — removes any output point whose latitude/longitude (rounded to 6 decimal places) is identical to the immediately preceding point. After rounding, adjacent fixes near the antimeridian can map to the same coordinate, producing zero-distance steps that cause errors in GPX viewers.
 
-**11. Segment splitting** — before writing, splits the flat point list into separate track segments wherever the time gap between consecutive points exceeds `--split-gap` hours (default 24). GPX viewers draw a connecting line between every adjacent point in a segment; without splitting, a 15-month gap between passages produces a straight line across the Pacific that can cause O(n²) rendering or spatial-index hangs in some applications (including GPX Editor on macOS).
+**10b. Zero-speed ghost filter** — scans the deduplicated output for adjacent point pairs within 1 m of each other (zero apparent speed). For each such pair, it examines the `--zerospd-window` context points on each side, *excluding the pair itself*. If the pair's position is more than `--zerospd-max-dist` km (default 50) from every external neighbour, the pair is a geographically isolated ghost island — the signature of a ghost track segment that survived all earlier filters — and both points are dropped. Genuine stationary positions (boat at anchor) have local neighbours within a few kilometres and are not affected. Excluding both pair members from the neighbour set is essential: including the immediate predecessor would mask isolation, since two points at the same remote position are trivially 0 m apart.
+
+**11. Segment splitting** — before writing, splits the flat point list into separate track segments wherever the time gap between consecutive points exceeds `--split-gap` hours (default 24). GPX viewers draw a connecting line between every adjacent point in a segment; without splitting, a 15-month gap between passages produces a straight line across the Pacific that can cause O(n²) rendering or spatial-index hangs in some applications (including GPX Editor on macOS). Single-point segments and 2-point segments with total distance below 10 m are also dropped at this stage.
 
 **12. Write** — writes a clean GPX 1.1 file with one track containing multiple segments (one per passage leg) and optional waypoints. The `xsi:schemaLocation` attribute that gpxpy normally includes is stripped from the output — some applications attempt to fetch the referenced XSD from the network on load, which causes a hang if the request is slow or firewalled. Output coordinates are rounded to 6 decimal places (~11 cm precision).
 
