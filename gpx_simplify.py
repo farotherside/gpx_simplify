@@ -302,13 +302,29 @@ def filter_speed_anomalies(
     stats: Stats,
 ) -> list[Point]:
     """
-    Remove points that imply an impossible speed.
+    Remove points that imply an impossible speed or position.
 
-    A point is dropped if BOTH of the following are true:
+    Normal case (dt > 0): a point is dropped if BOTH of the following are true:
       • the speed from the previous *kept* point to this point exceeds max_speed_knots
       • the speed from this point to the next point also exceeds max_speed_knots
     (This avoids dropping a valid point when two consecutive GPS fixes are very
     close in time but the boat just happened to be moving fast.)
+    The additional one-sided "impossible distance" check drops a point immediately
+    when no amount of look-ahead can make it geometrically reachable.
+
+    Zero-dt case (two points share the same timestamp): speed_knots() returns None
+    so the normal speed maths cannot be applied.  Instead we use a pure spatial
+    check against the *raw* previous point in the sorted array (not kept[-1], which
+    may itself be an outlier from a different GPS source).  If the raw predecessor
+    shares the same timestamp and is more than ~1 second's worth of travel away
+    (i.e. > max_speed × 1 s ≈ 26 m), the point is a ghost fix from a second GPS
+    recording the same instant but placing the vessel thousands of km away.
+    These clusters of simultaneous phantom positions cannot be caught by the
+    impossible-distance check because dt = 0 makes max_plausible_m = 0, which
+    would incorrectly flag every duplicate-position fix too.  The 1-second budget
+    is a deliberate conservative floor: a genuinely stationary duplicate should be
+    within a few metres of its twin; anything beyond 26 m at the same timestamp
+    is not a duplicate, it is a ghost.
     """
     log(VERBOSITY_INFO, verbosity, "info",
         f"🚀  Filtering speed anomalies > {max_speed_knots:.0f} kn …")
@@ -316,7 +332,13 @@ def filter_speed_anomalies(
     if not points:
         return points
 
+    # One second's worth of travel at the speed cap — used as the zero-dt distance floor.
+    _one_sec_max_m = max_speed_knots / 1.94384   # metres
+
     kept: list[Point] = [points[0]]
+    # Track which raw indices were kept so zero-dt duplicates of dropped points
+    # are themselves dropped (propagate-drop rule — see zero-dt branch below).
+    _kept_indices: set[int] = {0}
 
     with Progress(
         SpinnerColumn(),
@@ -331,10 +353,59 @@ def filter_speed_anomalies(
         task = progress.add_task("points", total=len(points) - 1)
 
         for i in range(1, len(points)):
-            cur  = points[i]
-            prev = kept[-1]
-            nxt  = points[i + 1] if i + 1 < len(points) else None
+            cur      = points[i]
+            prev     = kept[-1]
+            prev_raw = points[i - 1]   # immediate predecessor in sorted array
+            nxt      = points[i + 1] if i + 1 < len(points) else None
 
+            # ── zero-dt branch ────────────────────────────────────────────────
+            # Two points share the same timestamp.  speed_knots() would return None
+            # (dt ≈ 0), causing the normal branch to keep the point unconditionally.
+            #
+            # We handle this in two steps:
+            #
+            # (a) Propagate-drop: if the raw predecessor was itself dropped (it was a
+            #     ghost fix), drop this point too.  A ghost fix often appears in the
+            #     sorted list as a pair — the original ghost and then a duplicate of it
+            #     from a second logger — both at the same impossible position.  Without
+            #     this rule the duplicate would be kept and corrupt kept[-1].
+            #
+            # (b) Spatial check: if the raw predecessor was kept, compare positions.
+            #     If they share a timestamp but are more than one second's worth of
+            #     travel apart (~26 m at 50 kn), this is a ghost fix from a second GPS
+            #     recording the same instant but placing the vessel somewhere else.
+            if (cur.time is not None
+                    and prev_raw.time is not None
+                    and abs((cur.time - prev_raw.time).total_seconds()) < 1e-6):
+                if (i - 1) not in _kept_indices:
+                    # (a) raw predecessor was dropped → propagate drop
+                    stats.points_speed_drop += 1
+                    log(
+                        VERBOSITY_DEBUG, verbosity, "warn",
+                        f"    DROP (zero-dt propagate)  [{cur.source}] "
+                        f"{cur.lat:.5f},{cur.lon:.5f}  raw_prev was dropped",
+                    )
+                else:
+                    # (b) raw predecessor was kept → spatial check
+                    d_raw_prev = haversine_m(prev_raw.lat, prev_raw.lon, cur.lat, cur.lon)
+                    if d_raw_prev > _one_sec_max_m:
+                        stats.points_speed_drop += 1
+                        log(
+                            VERBOSITY_DEBUG, verbosity, "warn",
+                            f"    DROP (zero-dt ghost)  [{cur.source}] "
+                            f"{cur.lat:.5f},{cur.lon:.5f}  "
+                            f"d_raw_prev={d_raw_prev:.0f} m at dt=0",
+                        )
+                    else:
+                        log(VERBOSITY_TRACE, verbosity, "trace",
+                            f"    [{cur.source}] {cur.lat:.5f},{cur.lon:.5f} "
+                            f"— zero-dt duplicate, kept")
+                        kept.append(cur)
+                        _kept_indices.add(i)
+                progress.advance(task)
+                continue
+
+            # ── normal branch (dt > 0) ────────────────────────────────────────
             s_from_prev = speed_knots(prev, cur)
             s_to_next   = speed_knots(cur, nxt) if nxt else None
 
@@ -343,6 +414,7 @@ def filter_speed_anomalies(
                 log(VERBOSITY_TRACE, verbosity, "trace",
                     f"    [{cur.source}] {cur.lat:.5f},{cur.lon:.5f} — no timestamp, kept")
                 kept.append(cur)
+                _kept_indices.add(i)
                 progress.advance(task)
                 continue
 
@@ -393,6 +465,7 @@ def filter_speed_anomalies(
                     f"    keep  [{cur.source}] {cur.lat:.5f},{cur.lon:.5f} "
                     f"speed {s_from_prev:.1f} kn")
                 kept.append(cur)
+                _kept_indices.add(i)
 
             progress.advance(task)
 
