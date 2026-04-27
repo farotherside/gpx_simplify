@@ -1805,22 +1805,6 @@ def split_into_segments(
         f"    Split into {len(segments):,} segment(s) "
         f"(gap threshold: {split_gap_hours:.0f} h).",
     )
-
-    # Bridge segment joins so GPX viewers don't draw a connecting line across
-    # large gaps.  Copy the last point of each segment as the first point of
-    # the next segment: the viewer then draws a zero-length step at the join
-    # (same position repeated) rather than a straight line across the ocean.
-    # This preserves the segment structure (for GPX semantics / voyage legs)
-    # while making the rendered track appear visually continuous.
-    if len(segments) > 1:
-        bridged: list[list[Point]] = [segments[0]]
-        for seg in segments[1:]:
-            prev_last = bridged[-1][-1]
-            bridged.append([prev_last] + seg)
-        segments = bridged
-        log(VERBOSITY_DEBUG, verbosity, "debug",
-            f"    Duplicated segment endpoints to bridge {len(segments) - 1} join(s).")
-
     return segments
 
 
