@@ -15,6 +15,7 @@ Built for a real-world use case: ten years of sailing across the Pacific, around
 - **Elevation spike filter** — drops points whose altitude differs from the previous point by more than a configurable threshold (default 50 m); GPS elevation noise on a boat should never produce sudden multi-metre jumps
 - **Distance decimation** — reduces point density to a target spacing in metres, averaging clusters of nearby points into a centroid rather than simply discarding them
 - **Duplicate-position deduplication** — removes adjacent output points that map to the same rounded coordinate (prevents zero-distance steps in GPX viewers)
+- **Segment splitting** — splits the output into separate track segments wherever the time gap between consecutive points exceeds a configurable threshold (default 24 h); prevents GPX viewers from drawing straight lines across multi-day gaps between passages
 - **Waypoint passthrough** — optionally copies all named waypoints from the input to the output
 - **Rich terminal UI** — colour output, animated progress bars, and a summary table; multiple verbosity levels for debugging
 - **Dry-run mode** — analyse without writing any output
@@ -63,6 +64,7 @@ python gpx_simplify.py -i voyage.gpx --no-waypoints -vvv
 | `--max-crosstrack METRES` | `1000` | Max perpendicular deviation from the prev→next line before a point is an outlier |
 | `--max-crosstrack-rate M_PER_HOUR` | `93000` | Rate guard for the cross-track filter — keeps legitimate self-crossing tracks |
 | `--passes N` | `3` | Max cross-track filter passes (stops early when nothing is dropped) |
+| `--split-gap HOURS` | `24` | Split output into separate segments at time gaps longer than this; use 0 to disable |
 | `--waypoints / --no-waypoints` | waypoints on | Copy waypoints to output |
 | `-v / -vv / -vvv` | quiet | Verbosity: info / debug / trace |
 | `--dry-run` | off | Parse and filter but do not write output |
@@ -89,7 +91,9 @@ python gpx_simplify.py -i voyage.gpx --no-waypoints -vvv
 
 **10. Deduplicate positions** — removes any output point whose latitude/longitude (rounded to 6 decimal places) is identical to the immediately preceding point. After rounding, adjacent fixes near the antimeridian can map to the same coordinate, producing zero-distance steps that cause errors in GPX viewers.
 
-**11. Write** — writes a clean GPX 1.1 file with a single track segment and optional waypoints. The `xsi:schemaLocation` attribute that gpxpy normally includes is stripped from the output — some applications (including GPX Editor on macOS) attempt to fetch the referenced XSD from the network on load, which causes a hang if the request is slow or firewalled. Output coordinates are rounded to 6 decimal places (~11 cm precision).
+**11. Segment splitting** — before writing, splits the flat point list into separate track segments wherever the time gap between consecutive points exceeds `--split-gap` hours (default 24). GPX viewers draw a connecting line between every adjacent point in a segment; without splitting, a 15-month gap between passages produces a straight line across the Pacific that can cause O(n²) rendering or spatial-index hangs in some applications (including GPX Editor on macOS).
+
+**12. Write** — writes a clean GPX 1.1 file with one track containing multiple segments (one per passage leg) and optional waypoints. The `xsi:schemaLocation` attribute that gpxpy normally includes is stripped from the output — some applications attempt to fetch the referenced XSD from the network on load, which causes a hang if the request is slow or firewalled. Output coordinates are rounded to 6 decimal places (~11 cm precision).
 
 ## Example output
 
