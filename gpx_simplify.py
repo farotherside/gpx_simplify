@@ -181,6 +181,7 @@ class Stats:
     points_merge_drop:      int = 0
     points_duptime_drop:    int = 0
     points_duppos_drop:     int = 0
+    points_zerospd_drop:    int = 0
     points_out:             int = 0
     segments_out:           int = 0
     waypoints_in:           int = 0
@@ -245,10 +246,23 @@ def parse_gpx(path: Path, verbosity: int, stats: Stats) -> tuple[list[Point], li
                     stats.points_in += 1
                     if pt.time is None:
                         stats.points_no_time += 1
+                        log(
+                            VERBOSITY_DEBUG, verbosity, "debug",
+                            f"    DROP (no timestamp)  [{seg_label}] "
+                            f"{pt.latitude:.5f},{pt.longitude:.5f}",
+                        )
+                        # Points without timestamps cannot be speed-checked,
+                        # cross-track-checked, or placed correctly in the
+                        # chronological timeline.  Drop them at parse time
+                        # rather than silently appending them at the end of
+                        # the sorted list where they would produce a spurious
+                        # 'segment' of untimed fixes potentially far from the
+                        # rest of the track.
+                        continue
 
                     # Normalise to UTC-aware datetime
                     t = pt.time
-                    if t is not None and t.tzinfo is None:
+                    if t.tzinfo is None:
                         t = t.replace(tzinfo=timezone.utc)
 
                     p = Point(
@@ -270,8 +284,7 @@ def parse_gpx(path: Path, verbosity: int, stats: Stats) -> tuple[list[Point], li
     if stats.points_no_time:
         log(
             VERBOSITY_INFO, verbosity, "warn",
-            f"    ⚠  {stats.points_no_time:,} points have no timestamp "
-            "(they will be kept but cannot be speed- or cross-track-checked).",
+            f"    ⚠  {stats.points_no_time:,} points had no timestamp and were dropped.",
         )
 
     return all_points, waypoints
@@ -1097,6 +1110,120 @@ def deduplicate_positions(
     return kept
 
 
+# ── phase 8b: zero-speed ghost filter ────────────────────────────────────────
+def filter_zero_speed_ghosts(
+    points: list[Point],
+    neighbour_window: int,
+    max_neighbour_dist_m: float,
+    verbosity: int,
+    stats: Stats,
+) -> list[Point]:
+    """
+    Scan the decimated output for adjacent point pairs that are within a
+    negligible distance of each other (effectively zero speed between them).
+    For each such pair, examine the `neighbour_window` points on each side,
+    **excluding both points in the zero-distance pair itself**.  If no
+    external neighbour is within `max_neighbour_dist_m`, the pair is an
+    isolated ghost island: both points are dropped.
+
+    If the pair's position IS within `max_neighbour_dist_m` of at least one
+    external neighbour the position is plausible (boat at anchor, etc.) and
+    neither point is dropped.
+
+    Why exclude both pair members from the neighbour set?
+    A ghost island is exactly two consecutive points at the same position,
+    thousands of kilometres from the real track.  If we included point i in
+    the neighbour set when evaluating point i+1 (or vice versa), the inter-
+    pair distance of 0 m would always satisfy the threshold, masking the
+    isolation.  Excluding the pair itself forces the test to look at genuine
+    external context.
+
+    A single isolated output point (not preceded by a zero-distance step) is
+    not caught here — it is handled by the single-point segment drop in
+    split_into_segments.
+    """
+    log(VERBOSITY_INFO, verbosity, "info",
+        "🔍  Phase 8b: zero-speed ghost filter …")
+
+    if len(points) < 3:
+        log(VERBOSITY_INFO, verbosity, "info",
+            "    Too few points to filter — skipping.")
+        return points
+
+    # Threshold for "zero speed": adjacent output points closer than 1 m
+    ZERO_DIST_M = 1.0
+
+    drop_indices: set[int] = set()
+
+    i = 0
+    while i < len(points) - 1:
+        if i in drop_indices:
+            i += 1
+            continue
+
+        p1, p2 = points[i], points[i + 1]
+        d = haversine_m(p1.lat, p1.lon, p2.lat, p2.lon)
+        if d >= ZERO_DIST_M:
+            i += 1
+            continue
+
+        # Found a zero-distance pair (i, i+1).  Collect external neighbours —
+        # points within the window that are NOT part of this pair.
+        pair_indices = {i, i + 1}
+        lo = max(0, i - neighbour_window)
+        hi = min(len(points) - 1, i + 1 + neighbour_window)
+        neighbours: list[tuple[float, float]] = [
+            (points[j].lat, points[j].lon)
+            for j in range(lo, hi + 1)
+            if j not in pair_indices and j not in drop_indices
+        ]
+
+        if not neighbours:
+            # No external context available (e.g. start/end of track).
+            # Cannot make a safe determination — keep both points.
+            log(VERBOSITY_TRACE, verbosity, "trace",
+                f"    zero-spd  NO-CONTEXT  [{i},{i+1}]  "
+                f"{p1.lat:.5f},{p1.lon:.5f}  (keeping, no external neighbours)")
+            i += 1
+            continue
+
+        # Minimum distance from the pair's position to any external neighbour.
+        min_dist = min(
+            haversine_m(p1.lat, p1.lon, nlat, nlon)
+            for nlat, nlon in neighbours
+        )
+
+        if min_dist <= max_neighbour_dist_m:
+            # Position is consistent with local context — genuine stationary.
+            log(VERBOSITY_TRACE, verbosity, "trace",
+                f"    zero-spd  OK  [{i},{i+1}]  {p1.lat:.5f},{p1.lon:.5f}  "
+                f"min_ext_neighbour={min_dist/1000:.1f} km  (stationary)")
+            i += 1
+            continue
+
+        # Both points are remote from all external neighbours — ghost island.
+        log(VERBOSITY_DEBUG, verbosity, "debug",
+            f"    DROP (zero-spd ghost pair) [{i},{i+1}]  "
+            f"{p1.lat:.5f},{p1.lon:.5f}  "
+            f"t={p1.time}  min_ext_neighbour={min_dist/1000:.1f} km")
+        drop_indices.add(i)
+        drop_indices.add(i + 1)
+        stats.points_zerospd_drop += 2
+        i += 2  # skip both — the next pair check starts fresh
+
+    if drop_indices:
+        kept = [p for j, p in enumerate(points) if j not in drop_indices]
+        log(VERBOSITY_INFO, verbosity, "info",
+            f"    Dropped {stats.points_zerospd_drop:,} zero-speed ghost point(s).  "
+            f"{len(kept):,} remain.")
+    else:
+        kept = points
+        log(VERBOSITY_INFO, verbosity, "info",
+            "    No zero-speed ghosts found.")
+
+    return kept
+
+
 # ── phase 9: write output ─────────────────────────────────────────────────────
 def split_into_segments(
     points: list[Point],
@@ -1146,12 +1273,33 @@ def split_into_segments(
     # They arise when decimation emits exactly one point in a time window (e.g.
     # a brief GPS fix while in port), but a solo point with no neighbours is not
     # a useful track segment and can confuse some GPX applications.
-    segments = [s for s in raw_segments if len(s) >= 2]
+    #
+    # Also drop 2-point segments where the total distance is negligible (< 10 m).
+    # These arise when two ghost-fix centroids both survive into the same short
+    # time window; the segment looks like a 0-knot stop but the positions are
+    # effectively identical, producing a zero-length artefact.
+    MIN_SEGMENT_DIST_M = 10.0
+
+    def segment_ok(s: list[Point]) -> bool:
+        if len(s) < 2:
+            return False
+        if len(s) == 2:
+            d = haversine_m(s[0].lat, s[0].lon, s[1].lat, s[1].lon)
+            if d < MIN_SEGMENT_DIST_M:
+                log(VERBOSITY_DEBUG, verbosity, "debug",
+                    f"    segment drop: 2-pt zero-dist  "
+                    f"({s[0].lat:.5f},{s[0].lon:.5f} -> "
+                    f"{s[1].lat:.5f},{s[1].lon:.5f}  d={d:.2f} m)")
+                return False
+        return True
+
+    segments = [s for s in raw_segments if segment_ok(s)]
     n_dropped = len(raw_segments) - len(segments)
     if n_dropped:
         log(
             VERBOSITY_INFO, verbosity, "info",
-            f"    Dropped {n_dropped:,} single-point segment(s).",
+            f"    Dropped {n_dropped:,} degenerate segment(s) "
+            f"(single-point or zero-distance 2-point).",
         )
 
     stats.segments_out = len(segments)
@@ -1273,6 +1421,8 @@ def print_summary(stats: Stats, in_path: Path, out_path: Path, dry_run: bool) ->
     table.add_row("Merge drops",       f"{stats.points_merge_drop:,}")
     table.add_row("Duplicate-time drops", f"{stats.points_duptime_drop:,}")
     table.add_row("Duplicate-position drops", f"{stats.points_duppos_drop:,}")
+    table.add_row("Zero-speed ghost drops",
+                  f"[warn]{stats.points_zerospd_drop:,}[/warn]")
     table.add_row("Segments out",      f"[good]{stats.segments_out:,}[/good]")
     table.add_row("Points out",       f"[good]{stats.points_out:,}[/good]")
     if stats.points_in:
@@ -1403,6 +1553,22 @@ Examples:
             "Use 0 to disable splitting and write a single continuous segment."
         ),
     )
+    p.add_argument(
+        "--zerospd-window", type=int, default=10, metavar="N",
+        help=(
+            "Number of neighbouring output points to examine on each side when "
+            "evaluating a zero-speed (zero-distance) step. Default: 10."
+        ),
+    )
+    p.add_argument(
+        "--zerospd-max-dist", type=float, default=50.0, metavar="KM",
+        help=(
+            "Maximum distance in km from all local neighbours for a zero-speed "
+            "point to be considered a ghost fix and dropped. If the point is "
+            "within this distance of at least one neighbour it is treated as a "
+            "genuine stationary position (boat at anchor, etc.). Default: 50."
+        ),
+    )
     wp_group = p.add_mutually_exclusive_group()
     wp_group.add_argument(
         "--waypoints", dest="waypoints", action="store_true", default=True,
@@ -1511,6 +1677,13 @@ def main() -> int:
     points = filter_longitude_jumps(points, args.max_lon_jump, verbosity, stats)
     points = deduplicate_timestamps(points, verbosity, stats)
     points = deduplicate_positions(points, verbosity, stats)
+    points = filter_zero_speed_ghosts(
+        points,
+        neighbour_window=args.zerospd_window,
+        max_neighbour_dist_m=args.zerospd_max_dist * 1000.0,
+        verbosity=verbosity,
+        stats=stats,
+    )
 
     if not args.dry_run:
         write_gpx(out_path, points, waypoints, args.waypoints,
