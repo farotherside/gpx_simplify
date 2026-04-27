@@ -3,12 +3,13 @@
 gpx_simplify.py — Simplify large GPX files for sailing track archives.
 
 Merges all tracks/segments from multiple sources into a single chronologically
-sorted track, filters speed anomalies, and decimates to a target point spacing.
+sorted track, filters speed anomalies and geometric cross-track outliers, and
+decimates to a target point spacing.
 
 Usage:
     python gpx_simplify.py -i voyage.gpx -o simplified.gpx
     python gpx_simplify.py -i voyage.gpx -d 200 -s 40 -vv
-    python gpx_simplify.py -i voyage.gpx --dry-run -vvv
+    python gpx_simplify.py -i voyage.gpx --passes 5 --dry-run -vvv
 
 Requirements:
     pip install gpxpy rich
@@ -90,8 +91,9 @@ class Point:
     speed_to_next: float = 0.0   # knots
 
 
-# ── haversine distance ────────────────────────────────────────────────────────
+# ── geometry helpers ──────────────────────────────────────────────────────────
 EARTH_RADIUS_M = 6_371_000.0
+
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Return great-circle distance in metres between two lat/lon points."""
@@ -100,6 +102,49 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlam  = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
     return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
+
+
+def cross_track_distance_m(
+    lat_a: float, lon_a: float,   # start of baseline segment
+    lat_b: float, lon_b: float,   # end of baseline segment
+    lat_p: float, lon_p: float,   # candidate point
+) -> float:
+    """
+    Return the cross-track (perpendicular) distance in metres from point P to
+    the great-circle path A→B.
+
+    Uses the spherical cross-track formula:
+        d_xt = asin(sin(d_AP/R) * sin(θ_AP − θ_AB)) * R
+
+    where d_AP is the angular distance A→P and θ are bearings.
+    Returns the absolute cross-track deviation (always ≥ 0).
+    """
+    lat_a_r = math.radians(lat_a)
+    lon_a_r = math.radians(lon_a)
+    lat_b_r = math.radians(lat_b)
+    lon_b_r = math.radians(lon_b)
+    lat_p_r = math.radians(lat_p)
+    lon_p_r = math.radians(lon_p)
+
+    # Angular distance A→P
+    d_ap_r = haversine_m(lat_a, lon_a, lat_p, lon_p) / EARTH_RADIUS_M
+
+    # Bearing A→P
+    def bearing(la, lo, lb, lb2):
+        dlo = lb2 - lo
+        x = math.cos(lb) * math.sin(dlo)
+        y = math.cos(la) * math.sin(lb) - math.sin(la) * math.cos(lb) * math.cos(dlo)
+        return math.atan2(x, y)
+
+    theta_ap = bearing(lat_a_r, lon_a_r, lat_p_r, lon_p_r)
+    theta_ab = bearing(lat_a_r, lon_a_r, lat_b_r, lon_b_r)
+
+    # If A and B are the same point, cross-track = distance A→P
+    if haversine_m(lat_a, lon_a, lat_b, lon_b) < 1.0:
+        return haversine_m(lat_a, lon_a, lat_p, lon_p)
+
+    xt = math.asin(math.sin(d_ap_r) * math.sin(theta_ap - theta_ab)) * EARTH_RADIUS_M
+    return abs(xt)
 
 
 def speed_knots(p1: Point, p2: Point) -> Optional[float]:
@@ -114,20 +159,29 @@ def speed_knots(p1: Point, p2: Point) -> Optional[float]:
     return mps * 1.94384  # m/s → knots
 
 
+def time_gap_hours(p1: Point, p2: Point) -> Optional[float]:
+    """Return absolute time difference in hours between two points."""
+    if p1.time is None or p2.time is None:
+        return None
+    return abs((p2.time - p1.time).total_seconds()) / 3600.0
+
+
 # ── stats accumulator ────────────────────────────────────────────────────────
 @dataclass
 class Stats:
-    tracks_in:         int = 0
-    segments_in:       int = 0
-    points_in:         int = 0
-    points_no_time:    int = 0
-    points_speed_drop: int = 0
-    points_merge_drop: int = 0
-    points_out:        int = 0
-    waypoints_in:      int = 0
-    waypoints_out:     int = 0
-    total_dist_km:     float = 0.0
-    bbox:              list = field(default_factory=lambda: [90.0, 180.0, -90.0, -180.0])
+    tracks_in:              int = 0
+    segments_in:            int = 0
+    points_in:              int = 0
+    points_no_time:         int = 0
+    points_speed_drop:      int = 0
+    points_crosstrack_drop: int = 0
+    points_merge_drop:      int = 0
+    points_out:             int = 0
+    waypoints_in:           int = 0
+    waypoints_out:          int = 0
+    total_dist_km:          float = 0.0
+    crosstrack_passes:      int = 0
+    bbox:                   list = field(default_factory=lambda: [90.0, 180.0, -90.0, -180.0])
     # bbox = [min_lat, min_lon, max_lat, max_lon]
 
     def update_bbox(self, lat: float, lon: float) -> None:
@@ -163,7 +217,7 @@ def parse_gpx(path: Path, verbosity: int, stats: Stats) -> tuple[list[Point], li
         with open(path, "rb") as fh:
             gpx = gpxpy.parse(fh)
 
-        stats.tracks_in   = len(gpx.tracks)
+        stats.tracks_in    = len(gpx.tracks)
         stats.waypoints_in = len(gpx.waypoints)
         waypoints = list(gpx.waypoints)
 
@@ -211,7 +265,7 @@ def parse_gpx(path: Path, verbosity: int, stats: Stats) -> tuple[list[Point], li
         log(
             VERBOSITY_INFO, verbosity, "warn",
             f"    ⚠  {stats.points_no_time:,} points have no timestamp "
-            "(they will be kept but cannot be speed-checked).",
+            "(they will be kept but cannot be speed- or cross-track-checked).",
         )
 
     return all_points, waypoints
@@ -294,7 +348,8 @@ def filter_speed_anomalies(
                 log(
                     VERBOSITY_DEBUG, verbosity, "warn",
                     f"    DROP  [{cur.source}] {cur.lat:.5f},{cur.lon:.5f} "
-                    f"speed {s_from_prev:.0f} kn → {f'{s_to_next:.0f}' if s_to_next is not None else '?'} kn",
+                    f"speed {s_from_prev:.0f} kn → "
+                    f"{f'{s_to_next:.0f}' if s_to_next is not None else '?'} kn",
                 )
             else:
                 log(VERBOSITY_TRACE, verbosity, "trace",
@@ -310,7 +365,162 @@ def filter_speed_anomalies(
     return kept
 
 
-# ── phase 4: distance decimation ──────────────────────────────────────────────
+# ── phase 4: cross-track sanity filter (iterative) ───────────────────────────
+def _crosstrack_pass(
+    points: list[Point],
+    max_crosstrack_m: float,
+    max_crosstrack_rate_m_per_h: float,
+    verbosity: int,
+) -> tuple[list[Point], int]:
+    """
+    Single pass: examine every interior point and drop it if it is a geometric
+    outlier relative to its neighbours, *unless* the time gap to its neighbours
+    is large enough that a big positional deviation is plausible (i.e. the track
+    legitimately crossed over itself on a different passage).
+
+    The test is:
+        cross_track_distance > max_crosstrack_m
+        AND
+        cross_track_distance / time_gap_hours > max_crosstrack_rate_m_per_h
+
+    The second condition is the self-crossing guard: if the two neighbours are
+    days apart, a deviation of many km is fine. The rate threshold converts the
+    raw distance limit into a distance-per-hour budget — at the default of
+    50 kn ≈ 93 km/h, a 1,000 m deviation is only suspicious if the neighbours
+    are less than ~10 minutes apart.
+
+    Returns (kept_points, n_dropped).
+    """
+    if len(points) < 3:
+        return points, 0
+
+    kept: list[Point] = [points[0]]
+    dropped = 0
+
+    for i in range(1, len(points) - 1):
+        prev = kept[-1]          # last kept point (not necessarily points[i-1])
+        cur  = points[i]
+        nxt  = points[i + 1]
+
+        # Cannot do geometry without two valid neighbours
+        xt = cross_track_distance_m(
+            prev.lat, prev.lon,
+            nxt.lat,  nxt.lon,
+            cur.lat,  cur.lon,
+        )
+
+        if xt <= max_crosstrack_m:
+            log(VERBOSITY_TRACE, verbosity, "trace",
+                f"    xt-keep  {cur.lat:.5f},{cur.lon:.5f}  xt={xt:.0f} m")
+            kept.append(cur)
+            continue
+
+        # Point is geometrically far off the prev→next line.
+        # Check if the time span to its *nearest* neighbour is large — if so,
+        # the boat was simply in a different part of the ocean at a different
+        # time and the self-crossing guard should let it through.
+        #
+        # We use the MINIMUM of the two leg gaps (prev→cur, cur→nxt) so that
+        # a spike which is only 2 minutes from one neighbour is caught even
+        # if the other neighbour is hours away.
+        gap_prev_h = time_gap_hours(prev, cur)
+        gap_next_h = time_gap_hours(cur, nxt)
+
+        if gap_prev_h is None and gap_next_h is None:
+            # No timestamps — can't apply rate guard, keep the point
+            log(VERBOSITY_TRACE, verbosity, "trace",
+                f"    xt-keep (no time)  {cur.lat:.5f},{cur.lon:.5f}  xt={xt:.0f} m")
+            kept.append(cur)
+            continue
+
+        # Use whichever gap we have; prefer the smaller one
+        available = [g for g in (gap_prev_h, gap_next_h) if g is not None]
+        gap_h = min(available)   # tightest constraint wins
+
+        if gap_h < 1e-6:
+            # Simultaneous neighbour — deviation is definitely an error
+            rate = float("inf")
+        else:
+            rate = xt / gap_h   # metres per hour
+
+        if rate > max_crosstrack_rate_m_per_h:
+            dropped += 1
+            log(
+                VERBOSITY_DEBUG, verbosity, "warn",
+                f"    xt-DROP  [{cur.source}] {cur.lat:.5f},{cur.lon:.5f}  "
+                f"xt={xt:.0f} m  min-gap={gap_h*60:.1f} min  rate={rate:.0f} m/h",
+            )
+        else:
+            # Large deviation but spread over many hours — legitimate crossing
+            log(
+                VERBOSITY_DEBUG, verbosity, "debug",
+                f"    xt-keep (self-crossing guard)  {cur.lat:.5f},{cur.lon:.5f}  "
+                f"xt={xt:.0f} m  min-gap={gap_h*60:.1f} min  rate={rate:.0f} m/h",
+            )
+            kept.append(cur)
+
+    # Always keep the last point
+    kept.append(points[-1])
+    return kept, dropped
+
+
+def filter_crosstrack_anomalies(
+    points: list[Point],
+    max_crosstrack_m: float,
+    max_crosstrack_rate_m_per_h: float,
+    max_passes: int,
+    verbosity: int,
+    stats: Stats,
+) -> list[Point]:
+    """
+    Iteratively apply the cross-track filter until no more points are dropped
+    or max_passes is reached.
+
+    Iteration is necessary because dropping one outlier can unmask the next:
+    e.g. a cluster of three consecutive bad points where each looks reasonable
+    relative to its immediate neighbours will only be fully cleaned after
+    successive passes.
+    """
+    log(
+        VERBOSITY_INFO, verbosity, "info",
+        f"📐  Cross-track sanity filter: max deviation {max_crosstrack_m:.0f} m, "
+        f"rate guard {max_crosstrack_rate_m_per_h:.0f} m/h, "
+        f"up to {max_passes} pass(es) …",
+    )
+
+    pass_num = 0
+    total_dropped = 0
+
+    while pass_num < max_passes:
+        pass_num += 1
+        points, n_dropped = _crosstrack_pass(
+            points, max_crosstrack_m, max_crosstrack_rate_m_per_h, verbosity
+        )
+        total_dropped += n_dropped
+        stats.crosstrack_passes = pass_num
+
+        log(
+            VERBOSITY_INFO, verbosity, "info",
+            f"    Pass {pass_num}: dropped {n_dropped:,} points "
+            f"({len(points):,} remain).",
+        )
+
+        if n_dropped == 0:
+            log(VERBOSITY_INFO, verbosity, "good",
+                f"    ✓ Converged after {pass_num} pass(es).")
+            break
+    else:
+        if total_dropped > 0:
+            log(VERBOSITY_INFO, verbosity, "warn",
+                f"    ⚠  Reached pass limit ({max_passes}); "
+                f"{total_dropped:,} total points dropped. "
+                "Consider increasing --passes.")
+
+    stats.points_crosstrack_drop += total_dropped
+    return points
+
+
+# ── phase 5: distance decimation ──────────────────────────────────────────────
 def decimate_points(
     points: list[Point],
     min_distance_m: float,
@@ -451,7 +661,7 @@ def decimate_points(
     return output
 
 
-# ── phase 5: write output ─────────────────────────────────────────────────────
+# ── phase 6: write output ─────────────────────────────────────────────────────
 def write_gpx(
     out_path: Path,
     points: list[Point],
@@ -469,6 +679,8 @@ def write_gpx(
     gpx_out.description = (
         f"Processed {stats.points_in:,} input points → {stats.points_out:,} output points. "
         f"Speed filter: dropped {stats.points_speed_drop:,}. "
+        f"Cross-track filter: dropped {stats.points_crosstrack_drop:,} "
+        f"in {stats.crosstrack_passes} pass(es). "
         f"Merge-distance drops: {stats.points_merge_drop:,}."
     )
 
@@ -527,7 +739,11 @@ def print_summary(stats: Stats, in_path: Path, out_path: Path, dry_run: bool) ->
     table.add_row("Segments in",     f"{stats.segments_in:,}")
     table.add_row("Points in",       f"{stats.points_in:,}")
     table.add_row("  ↳ no timestamp",f"{stats.points_no_time:,}")
-    table.add_row("Speed anomalies dropped", f"[warn]{stats.points_speed_drop:,}[/warn]")
+    table.add_row("Speed anomalies dropped",
+                  f"[warn]{stats.points_speed_drop:,}[/warn]")
+    table.add_row("Cross-track anomalies dropped",
+                  f"[warn]{stats.points_crosstrack_drop:,}[/warn] "
+                  f"[dim](in {stats.crosstrack_passes} pass(es))[/dim]")
     table.add_row("Merge drops",     f"{stats.points_merge_drop:,}")
     table.add_row("Points out",      f"[good]{stats.points_out:,}[/good]")
     if stats.points_in:
@@ -553,23 +769,26 @@ def build_parser() -> argparse.ArgumentParser:
         prog="gpx_simplify",
         description=(
             "Simplify a large GPX file into a single clean track.\n"
-            "Merges all tracks/segments chronologically, removes speed anomalies,\n"
-            "and decimates to a target point spacing."
+            "Merges all tracks/segments chronologically, removes speed and\n"
+            "cross-track anomalies, and decimates to a target point spacing."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic run with defaults (100 m spacing, 50 kn speed limit):
+  # Basic run with defaults (100 m spacing, 50 kn speed limit, 3 sanity passes):
   python gpx_simplify.py -i voyage.gpx
 
-  # 200 m spacing, 40-knot cap, verbose:
-  python gpx_simplify.py -i voyage.gpx -o out.gpx -d 200 -s 40 -vv
+  # 200 m spacing, 40-knot cap, 5 sanity passes, verbose:
+  python gpx_simplify.py -i voyage.gpx -o out.gpx -d 200 -s 40 --passes 5 -vv
 
   # Dry run to see stats without writing:
   python gpx_simplify.py -i voyage.gpx --dry-run -v
 
-  # Drop waypoints, extra verbose:
-  python gpx_simplify.py -i voyage.gpx --no-waypoints -vvv
+  # Tighter cross-track tolerance (500 m), extra verbose:
+  python gpx_simplify.py -i voyage.gpx --max-crosstrack 500 -vvv
+
+  # Drop waypoints:
+  python gpx_simplify.py -i voyage.gpx --no-waypoints
 """,
     )
 
@@ -597,6 +816,31 @@ Examples:
         help=(
             "Maximum plausible speed in knots. Points implying a higher speed "
             "are treated as GPS errors and dropped. Default: 50"
+        ),
+    )
+    p.add_argument(
+        "--max-crosstrack", type=float, default=1000.0, metavar="METRES",
+        help=(
+            "Maximum perpendicular deviation (m) from the line between a point's "
+            "neighbours before it is considered a geometric outlier. "
+            "The self-crossing guard (--max-crosstrack-rate) prevents legitimate "
+            "track crossings from being dropped. Default: 1000"
+        ),
+    )
+    p.add_argument(
+        "--max-crosstrack-rate", type=float, default=93000.0, metavar="M_PER_HOUR",
+        help=(
+            "Cross-track outlier rate threshold in metres per hour. "
+            "If the deviation divided by the time gap between neighbours is below "
+            "this value, the point is kept (the track has legitimately crossed itself). "
+            "Default: 93000 (≈ 50 knots — same as default speed cap)."
+        ),
+    )
+    p.add_argument(
+        "--passes", type=int, default=3, metavar="N",
+        help=(
+            "Maximum number of cross-track filter passes to run. "
+            "The filter stops early if a pass drops nothing. Default: 3"
         ),
     )
     wp_group = p.add_mutually_exclusive_group()
@@ -640,13 +884,17 @@ def main() -> int:
     console.print(Panel(
         Text.from_markup(
             "[heading]gpx_simplify[/heading]  —  sailing track optimizer\n\n"
-            f"[info]Input :[/info]          {in_path}\n"
-            f"[info]Output:[/info]          {out_path}{'  [warn](dry run)[/warn]' if args.dry_run else ''}\n"
-            f"[info]Min distance:[/info]    {args.min_distance:.0f} m\n"
-            f"[info]Merge distance:[/info]  {args.merge_distance:.0f} m\n"
-            f"[info]Max speed:[/info]       {args.max_speed:.0f} kn\n"
-            f"[info]Waypoints:[/info]       {'yes' if args.waypoints else 'no'}\n"
-            f"[info]Verbosity:[/info]       {verbosity} "
+            f"[info]Input :[/info]              {in_path}\n"
+            f"[info]Output:[/info]              {out_path}"
+            f"{'  [warn](dry run)[/warn]' if args.dry_run else ''}\n"
+            f"[info]Min distance:[/info]        {args.min_distance:.0f} m\n"
+            f"[info]Merge distance:[/info]      {args.merge_distance:.0f} m\n"
+            f"[info]Max speed:[/info]           {args.max_speed:.0f} kn\n"
+            f"[info]Max cross-track:[/info]     {args.max_crosstrack:.0f} m\n"
+            f"[info]Cross-track rate:[/info]    {args.max_crosstrack_rate:.0f} m/h\n"
+            f"[info]Sanity passes:[/info]       {args.passes}\n"
+            f"[info]Waypoints:[/info]           {'yes' if args.waypoints else 'no'}\n"
+            f"[info]Verbosity:[/info]           {verbosity} "
             f"({'quiet' if verbosity == 0 else 'info' if verbosity == 1 else 'debug' if verbosity == 2 else 'trace'})",
         ),
         title="⛵  GPX Simplify",
@@ -664,6 +912,10 @@ def main() -> int:
                       "use -o to specify a different file.")
         return 1
 
+    if args.passes < 1:
+        console.print("[error]ERROR:[/error] --passes must be at least 1.")
+        return 1
+
     stats = Stats()
 
     # ── pipeline ──────────────────────────────────────────────────────────────
@@ -675,6 +927,14 @@ def main() -> int:
 
     points = sort_points(points, verbosity)
     points = filter_speed_anomalies(points, args.max_speed, verbosity, stats)
+    points = filter_crosstrack_anomalies(
+        points,
+        max_crosstrack_m=args.max_crosstrack,
+        max_crosstrack_rate_m_per_h=args.max_crosstrack_rate,
+        max_passes=args.passes,
+        verbosity=verbosity,
+        stats=stats,
+    )
     points = decimate_points(
         points,
         min_distance_m=args.min_distance,
