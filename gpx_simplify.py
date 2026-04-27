@@ -178,6 +178,7 @@ class Stats:
     points_ele_drop:        int = 0
     points_crosstrack_drop: int = 0
     points_merge_drop:      int = 0
+    points_duptime_drop:    int = 0
     points_out:             int = 0
     waypoints_in:           int = 0
     waypoints_out:          int = 0
@@ -740,7 +741,58 @@ def decimate_points(
     return output
 
 
-# ── phase 7: write output ─────────────────────────────────────────────────────
+# ── phase 7: duplicate-timestamp deduplication ───────────────────────────────
+def deduplicate_timestamps(
+    points: list[Point],
+    verbosity: int,
+    stats: Stats,
+) -> list[Point]:
+    """
+    Remove any output point that shares an identical timestamp with the
+    immediately preceding point.
+
+    This can happen after the centroid-averaging step when two source tracks
+    both have a fix at the same clock second but at different positions — both
+    survive the distance filter but end up adjacent in the output with the same
+    time value. Many GPX applications (including GPX Editor on macOS) attempt
+    to compute speed or heading between consecutive points by dividing distance
+    by time delta; a zero delta causes a divide-by-zero or infinite loop.
+
+    When a duplicate is found, the *first* of the pair is kept (it represents
+    the earlier-arriving source data) and the second is dropped.
+    Points without timestamps are never dropped by this pass.
+    """
+    log(VERBOSITY_INFO, verbosity, "info",
+        "🕐  Deduplicating adjacent same-timestamp points …")
+
+    if not points:
+        return points
+
+    kept: list[Point] = [points[0]]
+
+    for pt in points[1:]:
+        prev = kept[-1]
+        if (pt.time is not None
+                and prev.time is not None
+                and pt.time == prev.time):
+            stats.points_duptime_drop += 1
+            log(VERBOSITY_DEBUG, verbosity, "debug",
+                f"    dup-DROP  {pt.lat:.6f},{pt.lon:.6f}  t={pt.time.isoformat()}")
+        else:
+            kept.append(pt)
+
+    if stats.points_duptime_drop:
+        log(VERBOSITY_INFO, verbosity, "info",
+            f"    Dropped {stats.points_duptime_drop:,} duplicate-timestamp points.  "
+            f"{len(kept):,} remain.")
+    else:
+        log(VERBOSITY_INFO, verbosity, "info",
+            "    No duplicate timestamps found.")
+
+    return kept
+
+
+# ── phase 8: write output ─────────────────────────────────────────────────────
 def write_gpx(
     out_path: Path,
     points: list[Point],
@@ -783,9 +835,9 @@ def write_gpx(
         task = progress.add_task("writing", total=len(points))
         for pt in points:
             tp = gpxpy.gpx.GPXTrackPoint(
-                latitude=pt.lat,
-                longitude=pt.lon,
-                elevation=pt.ele,
+                latitude=round(pt.lat, 6),
+                longitude=round(pt.lon, 6),
+                elevation=round(pt.ele, 1) if pt.ele is not None else None,
                 time=pt.time,
             )
             segment.points.append(tp)
@@ -799,6 +851,19 @@ def write_gpx(
             f"    Copied {stats.waypoints_out} waypoints.")
 
     xml = gpx_out.to_xml()
+
+    # gpxpy always emits an xsi:schemaLocation pointing to topografix.com.
+    # Some XML parsers (including GPX Editor on macOS) attempt to fetch that
+    # URL for schema validation at load time.  If the request is slow or the
+    # app does it synchronously, the UI hangs.  Strip it from the output.
+    import re
+    xml = re.sub(
+        r'\s+xmlns:xsi="[^"]*"', '', xml, count=1
+    )
+    xml = re.sub(
+        r'\s+xsi:schemaLocation="[^"]*"', '', xml, count=1
+    )
+
     out_path.write_text(xml, encoding="utf-8")
 
     out_size = out_path.stat().st_size
@@ -826,8 +891,9 @@ def print_summary(stats: Stats, in_path: Path, out_path: Path, dry_run: bool) ->
     table.add_row("Cross-track anomalies dropped",
                   f"[warn]{stats.points_crosstrack_drop:,}[/warn] "
                   f"[dim](in {stats.crosstrack_passes} pass(es))[/dim]")
-    table.add_row("Merge drops",     f"{stats.points_merge_drop:,}")
-    table.add_row("Points out",      f"[good]{stats.points_out:,}[/good]")
+    table.add_row("Merge drops",       f"{stats.points_merge_drop:,}")
+    table.add_row("Duplicate-time drops", f"{stats.points_duptime_drop:,}")
+    table.add_row("Points out",       f"[good]{stats.points_out:,}[/good]")
     if stats.points_in:
         pct = (1 - stats.points_out / stats.points_in) * 100
         table.add_row("Reduction",   f"{pct:.1f}%")
@@ -1035,6 +1101,7 @@ def main() -> int:
         verbosity=verbosity,
         stats=stats,
     )
+    points = deduplicate_timestamps(points, verbosity, stats)
 
     if not args.dry_run:
         write_gpx(out_path, points, waypoints, args.waypoints, in_path, verbosity, stats)
