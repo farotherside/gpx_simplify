@@ -9,7 +9,7 @@ Built for a real-world use case: ten years of sailing across the Pacific, around
 ## Features
 
 - **Multi-source merge** — combines all tracks and segments from any number of sources, sorted chronologically into one unified track
-- **Speed anomaly filter** — drops points that imply physically impossible speeds using a one-sided impossibility check: if the distance from the previous kept point exceeds `max_speed × elapsed_time`, the point is dropped unconditionally. A second pass runs after decimation to catch impossible-speed steps created by centroid averaging across interleaved GPS sources.
+- **Speed anomaly filter** — drops points that imply physically impossible speeds or positions. For points with normal timestamps, uses a combined one-sided impossibility check and two-sided speed check. For points sharing an identical timestamp with their predecessor (a common artefact when two GPS loggers record the same instant), uses a spatial distance check against the raw predecessor: if two simultaneous points are more than one second's worth of travel apart, the second is a *ghost fix* from another source and is dropped. A second speed pass runs after decimation to catch impossible-speed steps created by centroid averaging across interleaved GPS sources.
 - **Antimeridian-safe centroid averaging** — cluster centroids near the date line (±180°) are computed using circular mean, preventing GPS fixes on opposite sides of the antimeridian from averaging to a point in the wrong hemisphere
 - **Longitude-jump filter** — catches GPS hemisphere-jumps (e.g. a fix at lon=-60° while crossing the date line near lon=±179°) that the speed filter may miss due to antimeridian wrapping; runs after decimation
 - **Elevation spike filter** — drops points whose altitude differs from the previous point by more than a configurable threshold (default 50 m); GPS elevation noise on a boat should never produce sudden multi-metre jumps
@@ -75,7 +75,10 @@ python gpx_simplify.py -i voyage.gpx --no-waypoints -vvv
 
 **2. Sort** — merges all points from all tracks and segments into a single chronological list (points without timestamps are appended at the end).
 
-**3. Speed filter** — walks the sorted list and drops any point where *both* the incoming and outgoing legs exceed the speed threshold. The two-sided check avoids falsely dropping a valid point that happens to follow or precede a tight cluster.
+**3. Speed filter** — walks the sorted list and drops GPS anomalies in two ways:
+
+- *Normal case (dt > 0):* a point is dropped if *both* the incoming and outgoing legs exceed the speed threshold, or if the distance from the previous kept point is physically impossible regardless of elapsed time. The two-sided check avoids falsely dropping a valid point that happens to follow or precede a tight cluster.
+- *Zero-dt case (same timestamp):* when two source points share an identical timestamp, the speed formula is undefined. Instead, the filter compares the point's position against its raw predecessor in the sorted array. If they share a timestamp but are more than one second's worth of travel apart (~26 m at 50 kn), the point is a *ghost fix* — a second GPS recording the same instant but placing the vessel somewhere else. These clusters of same-timestamp phantom positions (seen in real multi-source sailing data when redundant loggers store duplicate timestamps) are dropped unconditionally. True position duplicates (same timestamp, same position, a few metres apart) are kept.
 
 **4. Elevation filter** — drops any point whose altitude differs from the previous kept point by more than `--max-ele-change` (default 50 m). GPS altitude on a boat should be close to sea level and stable; sudden jumps of tens of metres are always sensor noise. Points without elevation data are passed through unchanged.
 
