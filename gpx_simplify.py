@@ -221,6 +221,7 @@ class Stats:
     points_duptime_drop:    int = 0
     points_duppos_drop:     int = 0
     points_zerospd_drop:    int = 0
+    points_bridge_fill:     int = 0
     points_gap_fill:        int = 0
     gaps_found:             int = 0
     gaps_filled:            int = 0
@@ -1519,6 +1520,94 @@ def interpolate_gap(gap: GapInfo, min_distance_m: float) -> list[Point]:
     return new_points
 
 
+def bridge_small_gaps(
+    points: list[Point],
+    max_bridge_dist_m: float,
+    min_distance_m: float,
+    verbosity: int,
+    stats: Stats,
+) -> list[Point]:
+    """
+    Silently fill any gap between adjacent output points whose great-circle
+    distance is less than `max_bridge_dist_m` (default 926 m = 0.5 nm).
+
+    These are GPS logger dropouts: the logger paused briefly and resumed
+    at a position that is nearby but not within the normal decimation
+    clustering distance.  They leave a visible nick in the rendered track.
+
+    Unlike fix_gaps (which handles large underway gaps interactively), this
+    phase runs unconditionally and silently — no prompt, no time-gap
+    condition.  A single great-circle-interpolated point is inserted at the
+    midpoint for gaps shorter than one output step; for slightly longer gaps
+    the normal interpolate_gap spacing applies.
+
+    Inserted points carry source='bridged' to distinguish them from both
+    real GPS fixes and manually-approved gap-fills.
+    """
+    log(VERBOSITY_INFO, verbosity, "info",
+        f"🔗  Phase 8d: bridge small gaps (< {max_bridge_dist_m/1852:.2f} nm) …")
+
+    if len(points) < 2:
+        log(VERBOSITY_INFO, verbosity, "info", "    Too few points — skipping.")
+        return points
+
+    # Build a GapInfo-compatible structure and reuse interpolate_gap.
+    # We scan for adjacent pairs where distance is in (min_distance_m, max_bridge_dist_m).
+    # Pairs under min_distance_m were already deduplicated; nothing to insert.
+    inserts: list[tuple[int, list[Point]]] = []
+
+    for i in range(len(points) - 1):
+        pa, pb = points[i], points[i + 1]
+        d = haversine_m(pa.lat, pa.lon, pb.lat, pb.lon)
+        if d <= min_distance_m or d >= max_bridge_dist_m:
+            continue
+
+        # Build a minimal GapInfo for interpolate_gap.
+        if pa.time and pb.time:
+            gap_time_h = (pb.time - pa.time).total_seconds() / 3600.0
+        else:
+            gap_time_h = 0.0
+
+        before_kn = _context_speed_kn(points, i,     look_before=True)
+        after_kn  = _context_speed_kn(points, i + 1, look_before=False)
+        fill_kn   = (before_kn + after_kn) / 2.0 if (before_kn > 0 and after_kn > 0) else max(before_kn, after_kn)
+        if fill_kn < 0.1:
+            fill_kn = 5.0
+
+        gap = GapInfo(
+            idx_before=i, idx_after=i + 1,
+            pt_before=pa, pt_after=pb,
+            gap_dist_m=d,
+            gap_time_h=gap_time_h,
+            before_kn=before_kn, after_kn=after_kn, fill_kn=fill_kn,
+        )
+        new_pts = interpolate_gap(gap, min_distance_m)
+        # Tag as bridged
+        for p in new_pts:
+            p.source = "bridged"
+
+        inserts.append((i, new_pts))
+        log(VERBOSITY_DEBUG, verbosity, "debug",
+            f"    bridge [{i}→{i+1}]  d={d:.0f} m  inserting {len(new_pts)} pt(s)")
+        stats.points_bridge_fill += len(new_pts)
+
+    if not inserts:
+        log(VERBOSITY_INFO, verbosity, "info", "    No small gaps found.")
+        return points
+
+    # Apply in reverse order to preserve indices
+    result: list[Point] = list(points)
+    for insert_after, new_pts in sorted(inserts, key=lambda x: x[0], reverse=True):
+        for k, pt in enumerate(new_pts):
+            result.insert(insert_after + 1 + k, pt)
+
+    log(VERBOSITY_INFO, verbosity, "info",
+        f"    Bridged {len(inserts):,} small gap(s), "
+        f"inserted {stats.points_bridge_fill:,} point(s).  "
+        f"{len(result):,} points total.")
+    return result
+
+
 def fix_gaps(
     points: list[Point],
     split_gap_hours: float,
@@ -1715,6 +1804,22 @@ def split_into_segments(
         f"    Split into {len(segments):,} segment(s) "
         f"(gap threshold: {split_gap_hours:.0f} h).",
     )
+
+    # Bridge segment joins so GPX viewers don't draw a connecting line across
+    # large gaps.  Copy the last point of each segment as the first point of
+    # the next segment: the viewer then draws a zero-length step at the join
+    # (same position repeated) rather than a straight line across the ocean.
+    # This preserves the segment structure (for GPX semantics / voyage legs)
+    # while making the rendered track appear visually continuous.
+    if len(segments) > 1:
+        bridged: list[list[Point]] = [segments[0]]
+        for seg in segments[1:]:
+            prev_last = bridged[-1][-1]
+            bridged.append([prev_last] + seg)
+        segments = bridged
+        log(VERBOSITY_DEBUG, verbosity, "debug",
+            f"    Duplicated segment endpoints to bridge {len(segments) - 1} join(s).")
+
     return segments
 
 
@@ -1830,6 +1935,8 @@ def print_summary(stats: Stats, in_path: Path, out_path: Path, dry_run: bool) ->
     table.add_row("Duplicate-position drops", f"{stats.points_duppos_drop:,}")
     table.add_row("Zero-speed ghost drops",
                   f"[warn]{stats.points_zerospd_drop:,}[/warn]")
+    if stats.points_bridge_fill:
+        table.add_row("Small-gap bridge points", f"{stats.points_bridge_fill:,}")
     if stats.gaps_found:
         table.add_row("Underway gaps found",  f"[warn]{stats.gaps_found:,}[/warn]")
         table.add_row("Gaps filled",          f"[good]{stats.gaps_filled:,}[/good]")
@@ -2110,6 +2217,14 @@ def main() -> int:
         points,
         neighbour_window=args.zerospd_window,
         max_neighbour_dist_m=args.zerospd_max_dist * 1000.0,
+        verbosity=verbosity,
+        stats=stats,
+    )
+
+    points = bridge_small_gaps(
+        points,
+        max_bridge_dist_m=0.5 * 1852.0,   # 0.5 nm in metres
+        min_distance_m=args.min_distance,
         verbosity=verbosity,
         stats=stats,
     )
