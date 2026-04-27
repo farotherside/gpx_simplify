@@ -3,13 +3,14 @@
 gpx_simplify.py — Simplify large GPX files for sailing track archives.
 
 Merges all tracks/segments from multiple sources into a single chronologically
-sorted track, filters speed anomalies and geometric cross-track outliers, and
-decimates to a target point spacing.
+sorted track, filters speed anomalies, elevation spikes, and geometric
+cross-track outliers, then decimates to a target point spacing.
 
 Usage:
     python gpx_simplify.py -i voyage.gpx -o simplified.gpx
     python gpx_simplify.py -i voyage.gpx -d 200 -s 40 -vv
     python gpx_simplify.py -i voyage.gpx --passes 5 --dry-run -vvv
+    python gpx_simplify.py -i voyage.gpx --max-ele-change 100
 
 Requirements:
     pip install gpxpy rich
@@ -174,6 +175,7 @@ class Stats:
     points_in:              int = 0
     points_no_time:         int = 0
     points_speed_drop:      int = 0
+    points_ele_drop:        int = 0
     points_crosstrack_drop: int = 0
     points_merge_drop:      int = 0
     points_out:             int = 0
@@ -365,7 +367,84 @@ def filter_speed_anomalies(
     return kept
 
 
-# ── phase 4: cross-track sanity filter (iterative) ───────────────────────────
+# ── phase 4: elevation-spike filter ──────────────────────────────────────────
+def filter_elevation_anomalies(
+    points: list[Point],
+    max_ele_change_m: float,
+    verbosity: int,
+    stats: Stats,
+) -> list[Point]:
+    """
+    Drop any point whose elevation differs from the previous *kept* point by
+    more than max_ele_change_m.
+
+    Rationale: a sailing GPS should never record a sudden altitude jump of
+    tens or hundreds of metres between adjacent fixes. Such values are always
+    sensor noise or a bad read. Points without elevation data are passed
+    through unchanged (elevation is optional in GPX).
+
+    The check is one-directional against the last *kept* point so that a run
+    of bad elevation values doesn't cascade — each candidate is always judged
+    against the most recent clean value.
+    """
+    log(VERBOSITY_INFO, verbosity, "info",
+        f"⛰️   Filtering elevation spikes > ±{max_ele_change_m:.0f} m …")
+
+    if not points:
+        return points
+
+    kept: list[Point] = []
+    last_ele: Optional[float] = None   # elevation of last kept point that had one
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[info]Elevation filter …"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("points", total=len(points))
+
+        for pt in points:
+            if pt.ele is None or last_ele is None:
+                # No elevation data on this point or no reference yet — keep it
+                # and update the reference if we just got our first elevation
+                kept.append(pt)
+                if pt.ele is not None:
+                    last_ele = pt.ele
+                log(VERBOSITY_TRACE, verbosity, "trace",
+                    f"    ele-keep (no data)  {pt.lat:.5f},{pt.lon:.5f}")
+                progress.advance(task)
+                continue
+
+            delta = abs(pt.ele - last_ele)
+
+            if delta > max_ele_change_m:
+                stats.points_ele_drop += 1
+                log(
+                    VERBOSITY_DEBUG, verbosity, "warn",
+                    f"    ele-DROP  [{pt.source}] {pt.lat:.5f},{pt.lon:.5f}  "
+                    f"ele={pt.ele:.1f} m  prev={last_ele:.1f} m  Δ={delta:.1f} m",
+                )
+            else:
+                kept.append(pt)
+                last_ele = pt.ele
+                log(VERBOSITY_TRACE, verbosity, "trace",
+                    f"    ele-keep  {pt.lat:.5f},{pt.lon:.5f}  "
+                    f"ele={pt.ele:.1f} m  Δ={delta:.1f} m")
+
+            progress.advance(task)
+
+    log(VERBOSITY_INFO, verbosity, "info",
+        f"    Dropped {stats.points_ele_drop:,} elevation-spike points.  "
+        f"{len(kept):,} remain.")
+    return kept
+
+
+# ── phase 5: cross-track sanity filter (iterative) ───────────────────────────
 def _crosstrack_pass(
     points: list[Point],
     max_crosstrack_m: float,
@@ -520,7 +599,7 @@ def filter_crosstrack_anomalies(
     return points
 
 
-# ── phase 5: distance decimation ──────────────────────────────────────────────
+# ── phase 6: distance decimation ──────────────────────────────────────────────
 def decimate_points(
     points: list[Point],
     min_distance_m: float,
@@ -661,7 +740,7 @@ def decimate_points(
     return output
 
 
-# ── phase 6: write output ─────────────────────────────────────────────────────
+# ── phase 7: write output ─────────────────────────────────────────────────────
 def write_gpx(
     out_path: Path,
     points: list[Point],
@@ -679,6 +758,7 @@ def write_gpx(
     gpx_out.description = (
         f"Processed {stats.points_in:,} input points → {stats.points_out:,} output points. "
         f"Speed filter: dropped {stats.points_speed_drop:,}. "
+        f"Elevation filter: dropped {stats.points_ele_drop:,}. "
         f"Cross-track filter: dropped {stats.points_crosstrack_drop:,} "
         f"in {stats.crosstrack_passes} pass(es). "
         f"Merge-distance drops: {stats.points_merge_drop:,}."
@@ -741,6 +821,8 @@ def print_summary(stats: Stats, in_path: Path, out_path: Path, dry_run: bool) ->
     table.add_row("  ↳ no timestamp",f"{stats.points_no_time:,}")
     table.add_row("Speed anomalies dropped",
                   f"[warn]{stats.points_speed_drop:,}[/warn]")
+    table.add_row("Elevation spikes dropped",
+                  f"[warn]{stats.points_ele_drop:,}[/warn]")
     table.add_row("Cross-track anomalies dropped",
                   f"[warn]{stats.points_crosstrack_drop:,}[/warn] "
                   f"[dim](in {stats.crosstrack_passes} pass(es))[/dim]")
@@ -819,6 +901,15 @@ Examples:
         ),
     )
     p.add_argument(
+        "--max-ele-change", type=float, default=50.0, metavar="METRES",
+        help=(
+            "Maximum elevation change in metres between adjacent points. "
+            "Points whose elevation differs from the previous kept point by more "
+            "than this value are treated as sensor errors and dropped. "
+            "Points without elevation data are unaffected. Default: 50"
+        ),
+    )
+    p.add_argument(
         "--max-crosstrack", type=float, default=1000.0, metavar="METRES",
         help=(
             "Maximum perpendicular deviation (m) from the line between a point's "
@@ -890,6 +981,7 @@ def main() -> int:
             f"[info]Min distance:[/info]        {args.min_distance:.0f} m\n"
             f"[info]Merge distance:[/info]      {args.merge_distance:.0f} m\n"
             f"[info]Max speed:[/info]           {args.max_speed:.0f} kn\n"
+            f"[info]Max ele change:[/info]      {args.max_ele_change:.0f} m\n"
             f"[info]Max cross-track:[/info]     {args.max_crosstrack:.0f} m\n"
             f"[info]Cross-track rate:[/info]    {args.max_crosstrack_rate:.0f} m/h\n"
             f"[info]Sanity passes:[/info]       {args.passes}\n"
@@ -927,6 +1019,7 @@ def main() -> int:
 
     points = sort_points(points, verbosity)
     points = filter_speed_anomalies(points, args.max_speed, verbosity, stats)
+    points = filter_elevation_anomalies(points, args.max_ele_change, verbosity, stats)
     points = filter_crosstrack_anomalies(
         points,
         max_crosstrack_m=args.max_crosstrack,
