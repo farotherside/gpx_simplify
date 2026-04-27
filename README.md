@@ -9,7 +9,7 @@ Built for a real-world use case: ten years of sailing across the Pacific, around
 ## Features
 
 - **Multi-source merge** — combines all tracks and segments from any number of sources, sorted chronologically into one unified track
-- **Speed anomaly filter** — drops points that imply physically impossible speeds (e.g. a sailboat "teleporting" across the ocean between two fixes)
+- **Speed anomaly filter** — drops points that imply physically impossible speeds using a one-sided impossibility check: if the distance from the previous kept point exceeds `max_speed × elapsed_time`, the point is dropped unconditionally. A second pass runs after decimation to catch impossible-speed steps created by centroid averaging across interleaved GPS sources.
 - **Antimeridian-safe centroid averaging** — cluster centroids near the date line (±180°) are computed using circular mean, preventing GPS fixes on opposite sides of the antimeridian from averaging to a point in the wrong hemisphere
 - **Longitude-jump filter** — catches GPS hemisphere-jumps (e.g. a fix at lon=-60° while crossing the date line near lon=±179°) that the speed filter may miss due to antimeridian wrapping; runs after decimation
 - **Elevation spike filter** — drops points whose altitude differs from the previous point by more than a configurable threshold (default 50 m); GPS elevation noise on a boat should never produce sudden multi-metre jumps
@@ -81,9 +81,11 @@ python gpx_simplify.py -i voyage.gpx --no-waypoints -vvv
 
 **5. Cross-track filter (iterative)** — for each interior point, computes its perpendicular distance from the great-circle line between its two neighbours. If the deviation exceeds `--max-crosstrack` *and* the deviation-per-hour exceeds `--max-crosstrack-rate`, the point is dropped as a GPS jump. The rate guard uses the *minimum* of the two leg gaps so a spike 2 minutes from one neighbour is caught even if the other is hours away. Runs up to `--passes` times, stopping early when a pass drops nothing.
 
-**6. Decimate** — walks the filtered list, accumulating nearby points into clusters. When the accumulated distance from the last emitted point reaches `--min-distance`, the centroid of the current cluster is emitted as one output point. Longitude is averaged using the circular mean (unit-vector method) so clusters near the antimeridian (±180°) are correctly averaged across the date line rather than collapsing to the wrong hemisphere.
+**6. Decimate** — walks the filtered list, accumulating nearby points into clusters. Longitude is averaged using the circular mean (see above). When the accumulated distance from the last emitted point reaches `--min-distance`, the centroid of the current cluster is emitted as one output point. Longitude is averaged using the circular mean (unit-vector method) so clusters near the antimeridian (±180°) are correctly averaged across the date line rather than collapsing to the wrong hemisphere.
 
 **7. Elevation filter** — scrubs implausible elevation values from the decimated list, nulling out the altitude for any point whose elevation differs from the previous clean value by more than `--max-ele-change`. The position is kept; only the altitude tag is removed.
+
+**7b. Post-decimation speed filter** — re-applies the impossible-distance check to the decimated output. Two interleaved GPS sources can each be internally consistent at low speed, yet produce adjacent output centroids with a physically impossible apparent speed (e.g. 494 m in 1 second = 961 kn) because their cluster median timestamps happen to fall 1–14 seconds apart. The pre-decimation filter cannot catch this; this second pass does.
 
 **8. Longitude-jump filter** — walks the decimated output and drops any point whose longitude differs from *both* its neighbours by more than `--max-lon-jump` degrees. Running after decimation catches rare antimeridian glitches that survive earlier filters because haversine wraps distances across ±180°.
 
