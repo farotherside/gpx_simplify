@@ -20,7 +20,7 @@ import argparse
 import math
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -148,6 +148,42 @@ def cross_track_distance_m(
     return abs(xt)
 
 
+def destination_point(
+    lat: float, lon: float, bearing_rad: float, distance_m: float
+) -> tuple[float, float]:
+    """
+    Return the lat/lon of a point reached by travelling `distance_m` metres
+    from (lat, lon) along `bearing_rad` (radians, clockwise from north) on a
+    spherical Earth.  Uses the spherical law of cosines (destination formula).
+    """
+    d = distance_m / EARTH_RADIUS_M   # angular distance (radians)
+    lat1 = math.radians(lat)
+    lon1 = math.radians(lon)
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(d)
+        + math.cos(lat1) * math.sin(d) * math.cos(bearing_rad)
+    )
+    lon2 = lon1 + math.atan2(
+        math.sin(bearing_rad) * math.sin(d) * math.cos(lat1),
+        math.cos(d) - math.sin(lat1) * math.sin(lat2),
+    )
+    return math.degrees(lat2), math.degrees(lon2)
+
+
+def initial_bearing_rad(
+    lat1: float, lon1: float, lat2: float, lon2: float
+) -> float:
+    """Return the initial great-circle bearing (radians) from point 1 to point 2."""
+    la1, lo1, la2, lo2 = (
+        math.radians(lat1), math.radians(lon1),
+        math.radians(lat2), math.radians(lon2),
+    )
+    dlo = lo2 - lo1
+    x = math.sin(dlo) * math.cos(la2)
+    y = math.cos(la1) * math.sin(la2) - math.sin(la1) * math.cos(la2) * math.cos(dlo)
+    return math.atan2(x, y)
+
+
 def speed_knots(p1: Point, p2: Point) -> Optional[float]:
     """Return speed in knots between two timed points, or None if no timestamps."""
     if p1.time is None or p2.time is None:
@@ -182,6 +218,9 @@ class Stats:
     points_duptime_drop:    int = 0
     points_duppos_drop:     int = 0
     points_zerospd_drop:    int = 0
+    points_gap_fill:        int = 0
+    gaps_found:             int = 0
+    gaps_filled:            int = 0
     points_out:             int = 0
     segments_out:           int = 0
     waypoints_in:           int = 0
@@ -1224,6 +1263,271 @@ def filter_zero_speed_ghosts(
     return kept
 
 
+# ── phase 8c: gap detection and interpolation ─────────────────────────────────
+CONTEXT_WINDOW = 10   # number of points before/after a gap used to estimate speed
+
+
+@dataclass
+class GapInfo:
+    """Describes a single detected gap between two adjacent output points."""
+    idx_before:     int           # index of last point before the gap
+    idx_after:      int           # index of first point after the gap
+    pt_before:      Point         # last point before the gap
+    pt_after:       Point         # first point after the gap
+    gap_dist_m:     float         # great-circle distance across the gap
+    gap_time_h:     float         # time span of the gap in hours
+    before_kn:      float         # average speed (kn) of CONTEXT_WINDOW pts before gap
+    after_kn:       float         # average speed (kn) of CONTEXT_WINDOW pts after gap
+    fill_kn:        float         # speed used for interpolation (mean of before/after)
+
+
+def _context_speed_kn(points: list[Point], centre_idx: int, look_before: bool) -> float:
+    """
+    Compute average speed (knots) over up to CONTEXT_WINDOW consecutive
+    point-to-point legs immediately before or after `centre_idx`.
+
+    Returns 0.0 if there are too few points or all legs have zero time.
+    """
+    if look_before:
+        lo = max(0, centre_idx - CONTEXT_WINDOW)
+        window = points[lo : centre_idx + 1]
+    else:
+        hi = min(len(points), centre_idx + CONTEXT_WINDOW + 1)
+        window = points[centre_idx : hi]
+
+    if len(window) < 2:
+        return 0.0
+
+    total_dist_m = 0.0
+    total_dt_s   = 0.0
+    for a, b in zip(window[:-1], window[1:]):
+        if a.time is None or b.time is None:
+            continue
+        dt = abs((b.time - a.time).total_seconds())
+        if dt < 1e-6:
+            continue
+        total_dist_m += haversine_m(a.lat, a.lon, b.lat, b.lon)
+        total_dt_s   += dt
+
+    if total_dt_s < 1e-6:
+        return 0.0
+    mps = total_dist_m / total_dt_s
+    return mps * 1.94384  # m/s → knots
+
+
+def detect_gaps(
+    points: list[Point],
+    split_gap_hours: float,
+    verbosity: int,
+) -> list[GapInfo]:
+    """
+    Walk the point list and identify every adjacent pair (i, i+1) where:
+      - the time gap exceeds split_gap_hours, AND
+      - the great-circle distance between them is greater than zero
+        (i.e. the vessel has moved — it's not just stopped in port).
+
+    Returns a list of GapInfo objects in order of occurrence.
+    """
+    gaps: list[GapInfo] = []
+    for i in range(len(points) - 1):
+        pa, pb = points[i], points[i + 1]
+        if pa.time is None or pb.time is None:
+            continue
+        dt_h = (pb.time - pa.time).total_seconds() / 3600.0
+        if dt_h <= split_gap_hours:
+            continue
+        dist_m = haversine_m(pa.lat, pa.lon, pb.lat, pb.lon)
+        if dist_m < 1.0:
+            # Vessel didn't move — this is a time-only gap (layup in port).
+            # Don't offer to fill it; there's nothing to interpolate.
+            log(VERBOSITY_DEBUG, verbosity, "debug",
+                f"    gap at [{i}→{i+1}]  dt={dt_h:.1f} h  dist={dist_m:.0f} m  "
+                f"(stationary, skip)")
+            continue
+
+        before_kn = _context_speed_kn(points, i,     look_before=True)
+        after_kn  = _context_speed_kn(points, i + 1, look_before=False)
+        # Use the mean of the two context speeds; if one side is 0 use the other.
+        if before_kn > 0 and after_kn > 0:
+            fill_kn = (before_kn + after_kn) / 2.0
+        else:
+            fill_kn = max(before_kn, after_kn)
+        # Clamp to a sensible sailing range if context is unavailable
+        if fill_kn < 0.1:
+            fill_kn = 5.0   # 5 kn default if we have no useful context
+
+        gaps.append(GapInfo(
+            idx_before=i,
+            idx_after=i + 1,
+            pt_before=pa,
+            pt_after=pb,
+            gap_dist_m=dist_m,
+            gap_time_h=dt_h,
+            before_kn=before_kn,
+            after_kn=after_kn,
+            fill_kn=fill_kn,
+        ))
+        log(VERBOSITY_DEBUG, verbosity, "debug",
+            f"    gap at [{i}→{i+1}]  dt={dt_h:.1f} h  "
+            f"dist={dist_m/1852:.1f} nm  "
+            f"ctx_speed={fill_kn:.1f} kn")
+
+    return gaps
+
+
+def interpolate_gap(gap: GapInfo, min_distance_m: float) -> list[Point]:
+    """
+    Generate interpolated track points that fill `gap` at `min_distance_m`
+    spacing, travelling along the great-circle from pt_before to pt_after.
+
+    The points are timed by dividing the gap interval proportionally to
+    distance (constant speed = fill_kn across the whole gap).  Elevation
+    is linearly interpolated if both endpoints have elevation data.
+
+    Returns the list of new interior points (does NOT include the endpoints).
+    """
+    pa, pb = gap.pt_before, gap.pt_after
+    total_dist_m = gap.gap_dist_m
+
+    if total_dist_m < min_distance_m:
+        # Gap is shorter than one output step — no interior points needed.
+        return []
+
+    bearing = initial_bearing_rad(pa.lat, pa.lon, pb.lat, pb.lon)
+
+    # Number of interior steps
+    n_steps = int(total_dist_m / min_distance_m)
+    step_m  = total_dist_m / (n_steps + 1)   # evenly divide so last pt != pb
+
+    # Time and elevation interpolation helpers
+    total_dt_s = (pb.time - pa.time).total_seconds()   # type: ignore[operator]
+    has_ele = pa.ele is not None and pb.ele is not None
+
+    new_points: list[Point] = []
+    for k in range(1, n_steps + 1):
+        frac = (k * step_m) / total_dist_m
+        lat, lon = destination_point(pa.lat, pa.lon, bearing, k * step_m)
+        t = pa.time + timedelta(seconds=frac * total_dt_s)   # type: ignore[operator]
+        ele = (pa.ele + frac * (pb.ele - pa.ele)) if has_ele else None   # type: ignore[operator]
+        new_points.append(Point(
+            lat=lat,
+            lon=lon,
+            ele=ele,
+            time=t,
+            source="interpolated",
+        ))
+
+    return new_points
+
+
+def fix_gaps(
+    points: list[Point],
+    split_gap_hours: float,
+    min_distance_m: float,
+    auto: bool,
+    verbosity: int,
+    stats: Stats,
+) -> list[Point]:
+    """
+    Detect underway gaps in the output track and offer to fill them with
+    interpolated points.
+
+    If `auto` is True, all gaps are filled without prompting.
+    Otherwise, each gap is described on the console and the user is asked
+    whether to fill it (y/n).  The loop runs until all gaps are resolved.
+
+    Filling is iterative: after a gap is filled the indices of subsequent
+    gaps shift, so detection is re-run after each fill.  In practice the
+    number of gaps is small (tens at most for a 10-year voyage) so the
+    re-scan cost is negligible.
+    """
+    log(VERBOSITY_INFO, verbosity, "info",
+        "🔗  Phase 8c: gap detection and interpolation …")
+
+    iteration = 0
+    total_inserted = 0
+
+    while True:
+        gaps = detect_gaps(points, split_gap_hours, verbosity)
+        if not gaps:
+            break
+
+        if iteration == 0:
+            stats.gaps_found = len(gaps)
+            console.print(
+                f"[warn]  Found {len(gaps):,} underway gap(s) in the track.[/warn]"
+            )
+
+        any_filled = False
+        inserts: list[tuple[int, list[Point]]] = []   # (insert-after-index, new_pts)
+
+        for gap in gaps:
+            pa, pb = gap.pt_before, gap.pt_after
+            dist_nm = gap.gap_dist_m / 1852.0
+
+            console.print(
+                f"\n[heading]  Gap:[/heading]  "
+                f"{pa.time.strftime('%Y-%m-%d %H:%M') if pa.time else '?'}  →  "   # type: ignore[union-attr]
+                f"{pb.time.strftime('%Y-%m-%d %H:%M') if pb.time else '?'}\n"       # type: ignore[union-attr]
+                f"         Duration:  {gap.gap_time_h:.1f} h\n"
+                f"         Distance:  {dist_nm:.1f} nm\n"
+                f"         From:      {pa.lat:.4f}°, {pa.lon:.4f}°\n"
+                f"         To:        {pb.lat:.4f}°, {pb.lon:.4f}°\n"
+                f"         Ctx speed: {gap.before_kn:.1f} kn (before) / "
+                f"{gap.after_kn:.1f} kn (after)  →  fill at {gap.fill_kn:.1f} kn\n"
+                f"         Est. pts:  "
+                f"{max(0, int(gap.gap_dist_m / min_distance_m)):,} "
+                f"at {min_distance_m/1000:.0f} km spacing"
+            )
+
+            if auto:
+                fill = True
+            else:
+                try:
+                    ans = input("  Fill this gap? [y/N] ").strip().lower()
+                except EOFError:
+                    ans = "n"
+                fill = ans in ("y", "yes")
+
+            if fill:
+                new_pts = interpolate_gap(gap, min_distance_m)
+                inserts.append((gap.idx_before, new_pts))
+                n = len(new_pts)
+                console.print(
+                    f"  [good]✔  Filling — inserting {n:,} point(s).[/good]"
+                )
+                any_filled = True
+                total_inserted += n
+                stats.gaps_filled += 1
+                stats.points_gap_fill += n
+            else:
+                console.print("  [dim]–  Skipped.[/dim]")
+
+        if not any_filled:
+            break
+
+        # Apply inserts in reverse order so earlier insertions don't shift later indices.
+        result: list[Point] = list(points)
+        for insert_after, new_pts in sorted(inserts, key=lambda x: x[0], reverse=True):
+            for k, pt in enumerate(new_pts):
+                result.insert(insert_after + 1 + k, pt)
+        points = result
+        iteration += 1
+
+    if total_inserted:
+        log(VERBOSITY_INFO, verbosity, "info",
+            f"    Inserted {total_inserted:,} interpolated point(s) across "
+            f"{stats.gaps_filled:,} gap(s).  {len(points):,} points total.")
+    elif stats.gaps_found == 0:
+        log(VERBOSITY_INFO, verbosity, "info",
+            "    No underway gaps found.")
+    else:
+        log(VERBOSITY_INFO, verbosity, "info",
+            f"    {stats.gaps_found:,} gap(s) found — none filled.")
+
+    return points
+
+
 # ── phase 9: write output ─────────────────────────────────────────────────────
 def split_into_segments(
     points: list[Point],
@@ -1423,6 +1727,10 @@ def print_summary(stats: Stats, in_path: Path, out_path: Path, dry_run: bool) ->
     table.add_row("Duplicate-position drops", f"{stats.points_duppos_drop:,}")
     table.add_row("Zero-speed ghost drops",
                   f"[warn]{stats.points_zerospd_drop:,}[/warn]")
+    if stats.gaps_found:
+        table.add_row("Underway gaps found",  f"[warn]{stats.gaps_found:,}[/warn]")
+        table.add_row("Gaps filled",          f"[good]{stats.gaps_filled:,}[/good]")
+        table.add_row("Gap-fill points added",f"[good]{stats.points_gap_fill:,}[/good]")
     table.add_row("Segments out",      f"[good]{stats.segments_out:,}[/good]")
     table.add_row("Points out",       f"[good]{stats.points_out:,}[/good]")
     if stats.points_in:
@@ -1551,6 +1859,24 @@ Examples:
             "This prevents GPX viewers from drawing a straight connecting line "
             "across multi-day or multi-month gaps (e.g. when the boat was in port). "
             "Use 0 to disable splitting and write a single continuous segment."
+        ),
+    )
+    p.add_argument(
+        "--fix-gaps", action="store_true", default=False,
+        help=(
+            "After processing, detect underway gaps in the output track — "
+            "time breaks longer than --split-gap hours where the vessel has "
+            "also moved — and offer to fill each one with interpolated points "
+            "spaced at --min-distance.  Interpolation speed is the mean of the "
+            "average speeds of the 10 output points immediately before and after "
+            "the gap.  Without --fix-gaps-auto the tool prompts for each gap."
+        ),
+    )
+    p.add_argument(
+        "--fix-gaps-auto", action="store_true", default=False,
+        help=(
+            "Fill all detected underway gaps automatically without prompting. "
+            "Implies --fix-gaps."
         ),
     )
     p.add_argument(
@@ -1684,6 +2010,16 @@ def main() -> int:
         verbosity=verbosity,
         stats=stats,
     )
+
+    if args.fix_gaps or args.fix_gaps_auto:
+        points = fix_gaps(
+            points,
+            split_gap_hours=args.split_gap,
+            min_distance_m=args.min_distance,
+            auto=args.fix_gaps_auto,
+            verbosity=verbosity,
+            stats=stats,
+        )
 
     if not args.dry_run:
         write_gpx(out_path, points, waypoints, args.waypoints,
