@@ -77,7 +77,9 @@ python gpx_simplify.py -i voyage.gpx --no-waypoints -vvv
 
 **6. Decimate** — walks the filtered list, accumulating nearby points into clusters. When the accumulated distance from the last emitted point reaches `--min-distance`, the centroid of the current cluster is emitted as one output point. This averages overlapping fixes from multiple sources rather than arbitrarily picking one.
 
-**7. Write** — writes a new GPX file with a single track segment, optional waypoints, and metadata describing the processing parameters.
+**7. Deduplicate timestamps** — removes any output point whose timestamp is identical to the immediately preceding point. This can occur when two source tracks both have a fix at the same clock second but at different positions; both survive the distance filter but would appear as adjacent points with a zero time delta, causing divide-by-zero errors in speed/heading calculations in downstream tools.
+
+**8. Write** — writes a clean GPX 1.1 file with a single track segment and optional waypoints. The `xsi:schemaLocation` attribute that gpxpy normally includes is stripped from the output — some applications (including GPX Editor on macOS) attempt to fetch the referenced XSD from the network on load, which causes a hang if the request is slow or firewalled. Output coordinates are rounded to 6 decimal places (~11 cm precision).
 
 ## Example output
 
