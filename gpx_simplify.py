@@ -19,6 +19,9 @@ Requirements:
 import argparse
 import math
 import sys
+import urllib.request
+import urllib.parse
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1263,6 +1266,102 @@ def filter_zero_speed_ghosts(
     return kept
 
 
+# ── reverse geocoding (Nominatim / OpenStreetMap) ─────────────────────────────
+_NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
+_NOMINATIM_UA  = "gpx_simplify/1.0 (sailing track tool; contact via github.com/farotherside/gpx_simplify)"
+_geocode_cache: dict[tuple[float, float], str] = {}
+
+
+def reverse_geocode(lat: float, lon: float, timeout: float = 5.0) -> str:
+    """
+    Return a human-readable location description for (lat, lon) using the
+    Nominatim reverse-geocoding API (OpenStreetMap).
+
+    The result is a short, landmark-first string built from the response's
+    address fields, e.g.:
+        "Watsons Bay, Sydney, New South Wales, Australia"
+        "Tasman Sea (~480 km E of Sydney)"   ← ocean fallback
+        "13.4521°N, 144.7937°E"              ← network-error fallback
+
+    Results are cached by rounded coordinate (0.01°) so repeated lookups
+    for nearby points don't hammer the API.  A polite User-Agent is sent
+    as required by Nominatim's usage policy.
+    """
+    cache_key = (round(lat, 2), round(lon, 2))
+    if cache_key in _geocode_cache:
+        return _geocode_cache[cache_key]
+
+    params = urllib.parse.urlencode({
+        "lat": f"{lat:.6f}",
+        "lon": f"{lon:.6f}",
+        "format": "jsonv2",
+        "zoom": 10,          # city / suburb level
+        "addressdetails": 1,
+        "accept-language": "en",
+    })
+    url = f"{_NOMINATIM_URL}?{params}"
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": _NOMINATIM_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        # Network error, rate-limit, or JSON parse failure — fall back to coords.
+        result = f"{abs(lat):.4f}°{'N' if lat >= 0 else 'S'}, {abs(lon):.4f}°{'E' if lon >= 0 else 'W'}"
+        _geocode_cache[cache_key] = result
+        return result
+
+    addr = data.get("address", {})
+    display = data.get("display_name", "")
+
+    # Build a concise landmark-first description from available address fields.
+    # Priority: named place / suburb / town → city/county → state → country.
+    parts: list[str] = []
+    for key in ("tourism", "amenity", "leisure", "natural", "hamlet",
+                "village", "suburb", "quarter", "neighbourhood",
+                "town", "city", "municipality"):
+        v = addr.get(key)
+        if v and v not in parts:
+            parts.append(v)
+        if len(parts) >= 2:
+            break
+
+    for key in ("county", "state_district", "state", "region", "country"):
+        v = addr.get(key)
+        if v and v not in parts:
+            parts.append(v)
+        if len(parts) >= 4:
+            break
+
+    if parts:
+        result = ", ".join(parts)
+    elif display:
+        # Nominatim returned something but address fields were empty — use the
+        # display_name but trim it to the first 3 comma-separated tokens.
+        tokens = [t.strip() for t in display.split(",")]
+        result = ", ".join(tokens[:3])
+    else:
+        result = f"{abs(lat):.4f}°{'N' if lat >= 0 else 'S'}, {abs(lon):.4f}°{'E' if lon >= 0 else 'W'}"
+
+    _geocode_cache[cache_key] = result
+    return result
+
+
+def location_label(lat: float, lon: float) -> str:
+    """
+    Return a combined coordinate + landmark string for display, e.g.:
+        -33.8568°, 151.2153° (Watsons Bay, Sydney, New South Wales, Australia)
+    Falls back to just the coordinate string if geocoding fails silently.
+    """
+    coord = (f"{abs(lat):.4f}°{'N' if lat >= 0 else 'S'}, "
+             f"{abs(lon):.4f}°{'E' if lon >= 0 else 'W'}")
+    place = reverse_geocode(lat, lon)
+    # If place IS the coordinate (fallback), don't duplicate it.
+    if place.startswith(coord[:6]):
+        return coord
+    return f"{coord}  ({place})"
+
+
 # ── phase 8c: gap detection and interpolation ─────────────────────────────────
 CONTEXT_WINDOW = 10   # number of points before/after a gap used to estimate speed
 
@@ -1465,14 +1564,18 @@ def fix_gaps(
             pa, pb = gap.pt_before, gap.pt_after
             dist_nm = gap.gap_dist_m / 1852.0
 
+            # Reverse-geocode both endpoints (may take a moment on first call).
+            from_label = location_label(pa.lat, pa.lon)
+            to_label   = location_label(pb.lat, pb.lon)
+
             console.print(
                 f"\n[heading]  Gap:[/heading]  "
                 f"{pa.time.strftime('%Y-%m-%d %H:%M') if pa.time else '?'}  →  "   # type: ignore[union-attr]
                 f"{pb.time.strftime('%Y-%m-%d %H:%M') if pb.time else '?'}\n"       # type: ignore[union-attr]
                 f"         Duration:  {gap.gap_time_h:.1f} h\n"
                 f"         Distance:  {dist_nm:.1f} nm\n"
-                f"         From:      {pa.lat:.4f}°, {pa.lon:.4f}°\n"
-                f"         To:        {pb.lat:.4f}°, {pb.lon:.4f}°\n"
+                f"         From:      {from_label}\n"
+                f"         To:        {to_label}\n"
                 f"         Ctx speed: {gap.before_kn:.1f} kn (before) / "
                 f"{gap.after_kn:.1f} kn (after)  →  fill at {gap.fill_kn:.1f} kn\n"
                 f"         Est. pts:  "
