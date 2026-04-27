@@ -338,7 +338,7 @@ def filter_speed_anomalies(
             s_from_prev = speed_knots(prev, cur)
             s_to_next   = speed_knots(cur, nxt) if nxt else None
 
-            # If we can't compute speed (missing timestamps), keep the point
+            # If we can't compute speed (missing timestamps on THIS point), keep it
             if s_from_prev is None:
                 log(VERBOSITY_TRACE, verbosity, "trace",
                     f"    [{cur.source}] {cur.lat:.5f},{cur.lon:.5f} — no timestamp, kept")
@@ -347,9 +347,40 @@ def filter_speed_anomalies(
                 continue
 
             over_limit_from = s_from_prev > max_speed_knots
-            over_limit_to   = (s_to_next is not None) and (s_to_next > max_speed_knots)
 
-            if over_limit_from and (over_limit_to or nxt is None):
+            # One-sided drop: if the distance from the last *kept* point is
+            # physically impossible regardless of what comes next, drop immediately.
+            # This catches cases where two interleaved GPS sources alternate such
+            # that the OUTGOING leg always looks slow (next point is back on the
+            # same source), allowing the bad point to sneak through the two-sided
+            # check.  A sailboat genuinely cannot be more than
+            # max_speed × elapsed_time away from the previous fix.
+            if prev.time and cur.time:
+                dt_s = abs((cur.time - prev.time).total_seconds())
+                max_plausible_m = (max_speed_knots / 1.94384) * dt_s
+                actual_m = haversine_m(prev.lat, prev.lon, cur.lat, cur.lon)
+                impossible = actual_m > max_plausible_m
+            else:
+                impossible = False
+
+            # s_to_next is None when:
+            #   (a) nxt has no timestamp → genuinely unknown → be conservative, keep
+            #   (b) cur and nxt share the same timestamp (dt=0) → degenerate step,
+            #       treat the same as being at the end of the list (drop if over limit)
+            nxt_has_no_time = (nxt is not None and nxt.time is None)
+            nxt_simultaneous = (nxt is not None and s_to_next is None and not nxt_has_no_time)
+
+            if s_to_next is not None:
+                over_limit_to = s_to_next > max_speed_knots
+            elif nxt is None or nxt_simultaneous:
+                # Last point, or next point is simultaneous (dt=0): outgoing leg
+                # is degenerate — count as over limit if incoming is already over
+                over_limit_to = over_limit_from
+            else:
+                # Next point has no timestamp — can't assess, be conservative
+                over_limit_to = False
+
+            if impossible or (over_limit_from and over_limit_to):
                 stats.points_speed_drop += 1
                 log(
                     VERBOSITY_DEBUG, verbosity, "warn",
@@ -878,6 +909,71 @@ def deduplicate_timestamps(
     return kept
 
 
+# ── phase 7b: post-decimation speed filter ───────────────────────────────────
+def filter_output_speed(
+    points: list[Point],
+    max_speed_knots: float,
+    verbosity: int,
+    stats: Stats,
+) -> list[Point]:
+    """
+    Re-apply the impossible-distance speed check to the decimated output.
+
+    After decimation, centroid centroids from two interleaved GPS sources can
+    end up adjacent in the output with a physically impossible apparent speed
+    (e.g. 494 m in 1 second = 961 kn), even though no individual raw point
+    exceeded the speed threshold.  This happens because:
+
+      • Both sources are internally consistent at slow speeds.
+      • Each source's cluster is just over the min-distance threshold apart.
+      • The centroid timestamps (median of cluster times) happen to be only
+        1–14 seconds apart across the two adjacent clusters.
+
+    The pre-decimation speed filter cannot catch this because it operates on
+    raw points, not on the averaged centroids.
+
+    This pass uses the same one-sided impossible-distance check: if the
+    distance from the previous *kept* output point is greater than
+    max_speed × elapsed_time, the point is dropped.
+    """
+    log(VERBOSITY_INFO, verbosity, "info",
+        f"🚀  Post-decimation speed check (max {max_speed_knots:.0f} kn) …")
+
+    if not points:
+        return points
+
+    kept: list[Point] = [points[0]]
+    dropped = 0
+    max_mps = max_speed_knots / 1.94384
+
+    for pt in points[1:]:
+        prev = kept[-1]
+        if prev.time and pt.time:
+            dt_s = abs((pt.time - prev.time).total_seconds())
+            if dt_s > 0:
+                max_plaus_m = max_mps * dt_s
+                actual_m = haversine_m(prev.lat, prev.lon, pt.lat, pt.lon)
+                if actual_m > max_plaus_m:
+                    dropped += 1
+                    stats.points_speed_drop += 1
+                    log(VERBOSITY_DEBUG, verbosity, "debug",
+                        f"    out-spd-DROP  {pt.lat:.6f},{pt.lon:.6f}  "
+                        f"d={actual_m:.0f}m  dt={dt_s:.0f}s  "
+                        f"max={max_plaus_m:.0f}m  t={pt.time}")
+                    continue
+        kept.append(pt)
+
+    if dropped:
+        log(VERBOSITY_INFO, verbosity, "info",
+            f"    Dropped {dropped:,} impossible-speed output points.  "
+            f"{len(kept):,} remain.")
+    else:
+        log(VERBOSITY_INFO, verbosity, "info",
+            "    No impossible-speed output points.")
+
+    return kept
+
+
 # ── phase 8: duplicate-position deduplication ────────────────────────────────
 def deduplicate_positions(
     points: list[Point],
@@ -953,7 +1049,7 @@ def split_into_segments(
         stats.segments_out = 1
         return [points]
 
-    segments: list[list[Point]] = []
+    raw_segments: list[list[Point]] = []
     current: list[Point] = [points[0]]
 
     for pt in points[1:]:
@@ -961,7 +1057,7 @@ def split_into_segments(
         if prev.time and pt.time:
             dt_h = (pt.time - prev.time).total_seconds() / 3600.0
             if dt_h > split_gap_hours:
-                segments.append(current)
+                raw_segments.append(current)
                 log(
                     VERBOSITY_DEBUG, verbosity, "debug",
                     f"    segment break: gap {dt_h:.1f} h  "
@@ -971,7 +1067,19 @@ def split_into_segments(
         current.append(pt)
 
     if current:
-        segments.append(current)
+        raw_segments.append(current)
+
+    # Drop single-point segments — they have zero length and no track to render.
+    # They arise when decimation emits exactly one point in a time window (e.g.
+    # a brief GPS fix while in port), but a solo point with no neighbours is not
+    # a useful track segment and can confuse some GPX applications.
+    segments = [s for s in raw_segments if len(s) >= 2]
+    n_dropped = len(raw_segments) - len(segments)
+    if n_dropped:
+        log(
+            VERBOSITY_INFO, verbosity, "info",
+            f"    Dropped {n_dropped:,} single-point segment(s).",
+        )
 
     stats.segments_out = len(segments)
     log(
@@ -1326,6 +1434,7 @@ def main() -> int:
         stats=stats,
     )
     points = filter_elevation_anomalies(points, args.max_ele_change, verbosity, stats)
+    points = filter_output_speed(points, args.max_speed, verbosity, stats)
     points = filter_longitude_jumps(points, args.max_lon_jump, verbosity, stats)
     points = deduplicate_timestamps(points, verbosity, stats)
     points = deduplicate_positions(points, verbosity, stats)
