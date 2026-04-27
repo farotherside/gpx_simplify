@@ -175,10 +175,12 @@ class Stats:
     points_in:              int = 0
     points_no_time:         int = 0
     points_speed_drop:      int = 0
+    points_lonjump_drop:    int = 0
     points_ele_drop:        int = 0
     points_crosstrack_drop: int = 0
     points_merge_drop:      int = 0
     points_duptime_drop:    int = 0
+    points_duppos_drop:     int = 0
     points_out:             int = 0
     waypoints_in:           int = 0
     waypoints_out:          int = 0
@@ -368,84 +370,76 @@ def filter_speed_anomalies(
     return kept
 
 
-# ── phase 4: elevation-spike filter ──────────────────────────────────────────
-def filter_elevation_anomalies(
+# ── phase 3b: longitude-jump filter ──────────────────────────────────────────
+def filter_longitude_jumps(
     points: list[Point],
-    max_ele_change_m: float,
+    max_lon_jump_deg: float,
     verbosity: int,
     stats: Stats,
 ) -> list[Point]:
     """
-    Drop any point whose elevation differs from the previous *kept* point by
-    more than max_ele_change_m.
+    Remove points whose longitude differs from BOTH neighbours by more than
+    max_lon_jump_deg degrees.
 
-    Rationale: a sailing GPS should never record a sudden altitude jump of
-    tens or hundreds of metres between adjacent fixes. Such values are always
-    sensor noise or a bad read. Points without elevation data are passed
-    through unchanged (elevation is optional in GPX).
+    This catches GPS glitches near the antimeridian (±180°) that the speed
+    filter misses.  When a boat is crossing the date line near lon=±179°, a
+    bad fix can land at e.g. lon=-60° (South Atlantic).  Haversine wraps the
+    longitude correctly and returns the geodesic distance, but if the bad
+    point is between two points that are themselves on opposite sides of ±180°
+    the geodesic distance to the nearest neighbour can appear deceptively small
+    (the sphere's shortest path crosses the antimeridian), fooling the speed
+    filter.
 
-    The check is one-directional against the last *kept* point so that a run
-    of bad elevation values doesn't cascade — each candidate is always judged
-    against the most recent clean value.
+    The longitude-jump check is purely angular and does NOT wrap at ±180: we
+    compare raw degree differences.  A point at lon=-60 surrounded by points
+    at lon=+179 and lon=-179 has |Δlon| of 239° and 119° respectively — both
+    far above any plausible single-step longitude change.
+
+    For filtering, we require BOTH neighbours to show a large jump: this
+    prevents the filter from dropping valid points at the start or end of a
+    long eastward or westward passage.
+
+    Default threshold: 90°.  A sailboat cannot legitimately move 90° of
+    longitude (~10,000 km at the equator) in a single GPS fix interval.
     """
     log(VERBOSITY_INFO, verbosity, "info",
-        f"⛰️   Filtering elevation spikes > ±{max_ele_change_m:.0f} m …")
+        f"🌐  Longitude-jump filter: dropping points with |Δlon| > "
+        f"{max_lon_jump_deg:.0f}° from BOTH neighbours …")
 
-    if not points:
+    if len(points) < 3:
         return points
 
-    kept: list[Point] = []
-    last_ele: Optional[float] = None   # elevation of last kept point that had one
+    kept: list[Point] = [points[0]]
+    dropped = 0
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[info]Elevation filter …"),
-        BarColumn(),
-        TaskProgressColumn(),
-        MofNCompleteColumn(),
-        TimeRemainingColumn(),
-        console=console,
-        transient=True,
-    ) as progress:
-        task = progress.add_task("points", total=len(points))
+    for i in range(1, len(points) - 1):
+        prev = kept[-1]
+        cur  = points[i]
+        nxt  = points[i + 1]
 
-        for pt in points:
-            if pt.ele is None or last_ele is None:
-                # No elevation data on this point or no reference yet — keep it
-                # and update the reference if we just got our first elevation
-                kept.append(pt)
-                if pt.ele is not None:
-                    last_ele = pt.ele
-                log(VERBOSITY_TRACE, verbosity, "trace",
-                    f"    ele-keep (no data)  {pt.lat:.5f},{pt.lon:.5f}")
-                progress.advance(task)
-                continue
+        d_prev = abs(cur.lon - prev.lon)
+        d_next = abs(cur.lon - nxt.lon)
 
-            delta = abs(pt.ele - last_ele)
+        if d_prev > max_lon_jump_deg and d_next > max_lon_jump_deg:
+            dropped += 1
+            stats.points_lonjump_drop += 1
+            log(
+                VERBOSITY_DEBUG, verbosity, "warn",
+                f"    lonjump-DROP  [{cur.source}] {cur.lat:.5f},{cur.lon:.5f}  "
+                f"|Δlon_prev|={d_prev:.1f}°  |Δlon_next|={d_next:.1f}°",
+            )
+        else:
+            kept.append(cur)
 
-            if delta > max_ele_change_m:
-                stats.points_ele_drop += 1
-                log(
-                    VERBOSITY_DEBUG, verbosity, "warn",
-                    f"    ele-DROP  [{pt.source}] {pt.lat:.5f},{pt.lon:.5f}  "
-                    f"ele={pt.ele:.1f} m  prev={last_ele:.1f} m  Δ={delta:.1f} m",
-                )
-            else:
-                kept.append(pt)
-                last_ele = pt.ele
-                log(VERBOSITY_TRACE, verbosity, "trace",
-                    f"    ele-keep  {pt.lat:.5f},{pt.lon:.5f}  "
-                    f"ele={pt.ele:.1f} m  Δ={delta:.1f} m")
-
-            progress.advance(task)
+    kept.append(points[-1])
 
     log(VERBOSITY_INFO, verbosity, "info",
-        f"    Dropped {stats.points_ele_drop:,} elevation-spike points.  "
+        f"    Dropped {dropped:,} longitude-jump points.  "
         f"{len(kept):,} remain.")
     return kept
 
 
-# ── phase 5: cross-track sanity filter (iterative) ───────────────────────────
+# ── phase 4: cross-track sanity filter (iterative) ───────────────────────────
 def _crosstrack_pass(
     points: list[Point],
     max_crosstrack_m: float,
@@ -600,7 +594,7 @@ def filter_crosstrack_anomalies(
     return points
 
 
-# ── phase 6: distance decimation ──────────────────────────────────────────────
+# ── phase 5: distance decimation ──────────────────────────────────────────────
 def decimate_points(
     points: list[Point],
     min_distance_m: float,
@@ -639,12 +633,28 @@ def decimate_points(
     last_emitted_lon: float = points[0].lon
     accumulated_dist: float = 0.0
 
+    def mean_longitude(lons: list[float]) -> float:
+        """
+        Compute the mean longitude, correctly handling the antimeridian (±180°).
+
+        Naive averaging of e.g. [-179.99, +179.99] gives 0°, which is wrong —
+        the two points are less than 0.02° apart across the date line.
+
+        We convert each longitude to a unit vector on the circle (cos, sin),
+        average the vectors, and take atan2 of the result.  This gives the
+        correct circular mean regardless of whether the cluster straddles ±180°.
+        """
+        import math as _math
+        sx = sum(_math.cos(_math.radians(lon)) for lon in lons)
+        sy = sum(_math.sin(_math.radians(lon)) for lon in lons)
+        return _math.degrees(_math.atan2(sy, sx))
+
     def flush_cluster() -> Optional[Point]:
         """Emit the centroid of the current cluster as one output point."""
         if not cluster_lats:
             return None
         avg_lat = sum(cluster_lats) / len(cluster_lats)
-        avg_lon = sum(cluster_lons) / len(cluster_lons)
+        avg_lon = mean_longitude(cluster_lons)
         avg_ele = (sum(cluster_eles) / len(cluster_eles)) if cluster_eles else None
         # Use median time (middle index) to keep a real timestamp
         t = sorted(cluster_times)[len(cluster_times) // 2] if cluster_times else None
@@ -741,6 +751,81 @@ def decimate_points(
     return output
 
 
+# ── phase 6: elevation-spike filter (post-decimation) ────────────────────────
+def filter_elevation_anomalies(
+    points: list[Point],
+    max_ele_change_m: float,
+    verbosity: int,
+    stats: Stats,
+) -> list[Point]:
+    """
+    Scrub implausible elevation values from the already-decimated point list.
+
+    This runs AFTER decimation deliberately.  Running it before decimation
+    caused a severe problem: dropping 30%+ of points before the distance
+    accumulator ran meant that tiny track fragments survived decimation as
+    individual points, inflating the output count from ~5k to ~114k on a
+    real 40 MB file.
+
+    Rather than dropping the whole point (which would remove a valid position
+    and could re-introduce the same fragmentation problem), we NULL OUT the
+    bad elevation value while keeping the lat/lon.  The point stays in the
+    track; it just won't have an altitude tag in the output.
+
+    A sailing GPS should never record altitude jumps of tens of metres between
+    adjacent fixes at sea.  Any such jump is sensor noise.
+    """
+    log(VERBOSITY_INFO, verbosity, "info",
+        f"⛰️   Scrubbing elevation spikes > ±{max_ele_change_m:.0f} m …")
+
+    if not points:
+        return points
+
+    last_ele: Optional[float] = None   # last clean elevation seen
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[info]Elevation filter …"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("points", total=len(points))
+
+        for pt in points:
+            if pt.ele is None or last_ele is None:
+                if pt.ele is not None:
+                    last_ele = pt.ele
+                progress.advance(task)
+                continue
+
+            delta = abs(pt.ele - last_ele)
+
+            if delta > max_ele_change_m:
+                stats.points_ele_drop += 1
+                log(
+                    VERBOSITY_DEBUG, verbosity, "warn",
+                    f"    ele-SCRUB  [{pt.source}] {pt.lat:.5f},{pt.lon:.5f}  "
+                    f"ele={pt.ele:.1f} m  prev={last_ele:.1f} m  delta={delta:.1f} m",
+                )
+                pt.ele = None   # null out bad elevation, keep position
+            else:
+                last_ele = pt.ele
+                log(VERBOSITY_TRACE, verbosity, "trace",
+                    f"    ele-ok  {pt.lat:.5f},{pt.lon:.5f}  "
+                    f"ele={pt.ele:.1f} m  delta={delta:.1f} m")
+
+            progress.advance(task)
+
+    log(VERBOSITY_INFO, verbosity, "info",
+        f"    Scrubbed elevation on {stats.points_ele_drop:,} points "
+        f"({len(points):,} positions unchanged).")
+    return points
+
+
 # ── phase 7: duplicate-timestamp deduplication ───────────────────────────────
 def deduplicate_timestamps(
     points: list[Point],
@@ -792,7 +877,57 @@ def deduplicate_timestamps(
     return kept
 
 
-# ── phase 8: write output ─────────────────────────────────────────────────────
+# ── phase 8: duplicate-position deduplication ────────────────────────────────
+def deduplicate_positions(
+    points: list[Point],
+    verbosity: int,
+    stats: Stats,
+) -> list[Point]:
+    """
+    Remove any output point that has an identical rounded lat/lon to the
+    immediately preceding point.
+
+    After coordinates are rounded to 6 decimal places (~11 cm) at write time,
+    adjacent points near the antimeridian (lon ≈ ±179.999°) can map to the
+    same rounded position even if they were distinct before rounding.  Such
+    zero-distance steps cause divide-by-zero or infinite-speed calculations in
+    downstream GPX tools (including GPX Editor on macOS).
+
+    We round to 6 dp here to match the write_gpx rounding, so what we discard
+    is exactly what would produce zero-distance steps in the output file.
+
+    When a duplicate is found, the *first* of the pair is kept.
+    """
+    log(VERBOSITY_INFO, verbosity, "info",
+        "📍  Deduplicating adjacent same-position points (after 6-dp rounding) …")
+
+    if not points:
+        return points
+
+    kept: list[Point] = [points[0]]
+
+    for pt in points[1:]:
+        prev = kept[-1]
+        if (round(pt.lat, 6) == round(prev.lat, 6)
+                and round(pt.lon, 6) == round(prev.lon, 6)):
+            stats.points_duppos_drop += 1
+            log(VERBOSITY_DEBUG, verbosity, "debug",
+                f"    duppos-DROP  {pt.lat:.6f},{pt.lon:.6f}  t={pt.time}")
+        else:
+            kept.append(pt)
+
+    if stats.points_duppos_drop:
+        log(VERBOSITY_INFO, verbosity, "info",
+            f"    Dropped {stats.points_duppos_drop:,} duplicate-position points.  "
+            f"{len(kept):,} remain.")
+    else:
+        log(VERBOSITY_INFO, verbosity, "info",
+            "    No duplicate positions found.")
+
+    return kept
+
+
+# ── phase 9: write output ─────────────────────────────────────────────────────
 def write_gpx(
     out_path: Path,
     points: list[Point],
@@ -808,12 +943,14 @@ def write_gpx(
     gpx_out.creator = "gpx_simplify.py"
     gpx_out.name = f"Simplified track from {source_path.name}"
     gpx_out.description = (
-        f"Processed {stats.points_in:,} input points → {stats.points_out:,} output points. "
+        f"Processed {stats.points_in:,} input points -> {stats.points_out:,} output points. "
         f"Speed filter: dropped {stats.points_speed_drop:,}. "
+        f"Longitude-jump filter: dropped {stats.points_lonjump_drop:,}. "
         f"Elevation filter: dropped {stats.points_ele_drop:,}. "
         f"Cross-track filter: dropped {stats.points_crosstrack_drop:,} "
         f"in {stats.crosstrack_passes} pass(es). "
-        f"Merge-distance drops: {stats.points_merge_drop:,}."
+        f"Merge-distance drops: {stats.points_merge_drop:,}. "
+        f"Duplicate-position drops: {stats.points_duppos_drop:,}."
     )
 
     track = gpxpy.gpx.GPXTrack()
@@ -886,6 +1023,8 @@ def print_summary(stats: Stats, in_path: Path, out_path: Path, dry_run: bool) ->
     table.add_row("  ↳ no timestamp",f"{stats.points_no_time:,}")
     table.add_row("Speed anomalies dropped",
                   f"[warn]{stats.points_speed_drop:,}[/warn]")
+    table.add_row("Longitude-jump anomalies dropped",
+                  f"[warn]{stats.points_lonjump_drop:,}[/warn]")
     table.add_row("Elevation spikes dropped",
                   f"[warn]{stats.points_ele_drop:,}[/warn]")
     table.add_row("Cross-track anomalies dropped",
@@ -893,6 +1032,7 @@ def print_summary(stats: Stats, in_path: Path, out_path: Path, dry_run: bool) ->
                   f"[dim](in {stats.crosstrack_passes} pass(es))[/dim]")
     table.add_row("Merge drops",       f"{stats.points_merge_drop:,}")
     table.add_row("Duplicate-time drops", f"{stats.points_duptime_drop:,}")
+    table.add_row("Duplicate-position drops", f"{stats.points_duppos_drop:,}")
     table.add_row("Points out",       f"[good]{stats.points_out:,}[/good]")
     if stats.points_in:
         pct = (1 - stats.points_out / stats.points_in) * 100
@@ -903,7 +1043,7 @@ def print_summary(stats: Stats, in_path: Path, out_path: Path, dry_run: bool) ->
     if stats.bbox[0] < 90:
         table.add_row(
             "Bounding box",
-            f"{stats.bbox[0]:.4f}°, {stats.bbox[1]:.4f}°  →  "
+            f"{stats.bbox[0]:.4f}°, {stats.bbox[1]:.4f}°  ->  "
             f"{stats.bbox[2]:.4f}°, {stats.bbox[3]:.4f}°",
         )
 
@@ -949,8 +1089,12 @@ Examples:
         help="Output GPX file path. Default: <input>_simplified.gpx",
     )
     p.add_argument(
-        "-d", "--min-distance", type=float, default=100.0, metavar="METRES",
-        help="Minimum distance between output track points in metres. Default: 100",
+        "-d", "--min-distance", type=float, default=1000.0, metavar="METRES",
+        help=(
+            "Minimum distance between output track points in metres. Default: 1000. "
+            "For long ocean voyages (thousands of km), 1000m gives a clean track "
+            "that any viewer can handle. Use 100-500m for shorter detailed passages."
+        ),
     )
     p.add_argument(
         "-m", "--merge-distance", type=float, default=100.0, metavar="METRES",
@@ -973,6 +1117,14 @@ Examples:
             "Points whose elevation differs from the previous kept point by more "
             "than this value are treated as sensor errors and dropped. "
             "Points without elevation data are unaffected. Default: 50"
+        ),
+    )
+    p.add_argument(
+        "--max-lon-jump", type=float, default=90.0, metavar="DEGREES",
+        help=(
+            "Maximum longitude difference in degrees between a point and BOTH its "
+            "neighbours before the point is treated as a GPS hemisphere jump. "
+            "Catches antimeridian glitches that the speed filter misses. Default: 90"
         ),
     )
     p.add_argument(
@@ -1047,6 +1199,7 @@ def main() -> int:
             f"[info]Min distance:[/info]        {args.min_distance:.0f} m\n"
             f"[info]Merge distance:[/info]      {args.merge_distance:.0f} m\n"
             f"[info]Max speed:[/info]           {args.max_speed:.0f} kn\n"
+            f"[info]Max lon jump:[/info]        {args.max_lon_jump:.0f}°\n"
             f"[info]Max ele change:[/info]      {args.max_ele_change:.0f} m\n"
             f"[info]Max cross-track:[/info]     {args.max_crosstrack:.0f} m\n"
             f"[info]Cross-track rate:[/info]    {args.max_crosstrack_rate:.0f} m/h\n"
@@ -1085,7 +1238,6 @@ def main() -> int:
 
     points = sort_points(points, verbosity)
     points = filter_speed_anomalies(points, args.max_speed, verbosity, stats)
-    points = filter_elevation_anomalies(points, args.max_ele_change, verbosity, stats)
     points = filter_crosstrack_anomalies(
         points,
         max_crosstrack_m=args.max_crosstrack,
@@ -1101,7 +1253,10 @@ def main() -> int:
         verbosity=verbosity,
         stats=stats,
     )
+    points = filter_elevation_anomalies(points, args.max_ele_change, verbosity, stats)
+    points = filter_longitude_jumps(points, args.max_lon_jump, verbosity, stats)
     points = deduplicate_timestamps(points, verbosity, stats)
+    points = deduplicate_positions(points, verbosity, stats)
 
     if not args.dry_run:
         write_gpx(out_path, points, waypoints, args.waypoints, in_path, verbosity, stats)
