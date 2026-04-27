@@ -1437,12 +1437,13 @@ def detect_gaps(
         if dt_h <= split_gap_hours:
             continue
         dist_m = haversine_m(pa.lat, pa.lon, pb.lat, pb.lon)
-        if dist_m < 1.0:
-            # Vessel didn't move — this is a time-only gap (layup in port).
-            # Don't offer to fill it; there's nothing to interpolate.
+        # Gaps under 0.5 nm are already handled by bridge_small_gaps and
+        # should never reach here.  Treat anything under 0.5 nm as a
+        # stationary or near-stationary stop — nothing to prompt about.
+        if dist_m < 926.0:   # 0.5 nm in metres
             log(VERBOSITY_DEBUG, verbosity, "debug",
                 f"    gap at [{i}→{i+1}]  dt={dt_h:.1f} h  dist={dist_m:.0f} m  "
-                f"(stationary, skip)")
+                f"(< 0.5 nm, skip)")
             continue
 
         before_kn = _context_speed_kn(points, i,     look_before=True)
