@@ -18,6 +18,7 @@ Built for a real-world use case: ten years of sailing across the Pacific, around
 - **Distance decimation** — reduces point density to a target spacing in metres, averaging clusters of nearby points into a centroid rather than simply discarding them
 - **Duplicate-position deduplication** — removes adjacent output points that map to the same rounded coordinate (prevents zero-distance steps in GPX viewers)
 - **Segment splitting** — splits the output into separate track segments wherever the time gap between consecutive points exceeds a configurable threshold (default 24 h); prevents GPX viewers from drawing straight lines across multi-day gaps between passages
+- **Gap detection and filling** — optionally scans the output for *underway gaps*: time breaks longer than `--split-gap` hours where the vessel has also moved (distinguishing passage gaps from in-port layups). For each gap, prints the start/end time, distance, and estimated fill speed (mean of the 10-point average speed immediately before and after the gap), then prompts whether to fill it with great-circle-interpolated points spaced at `--min-distance`. Use `--fix-gaps-auto` to fill all gaps without prompting.
 - **Waypoint passthrough** — optionally copies all named waypoints from the input to the output
 - **Rich terminal UI** — colour output, animated progress bars, and a summary table; multiple verbosity levels for debugging
 - **Dry-run mode** — analyse without writing any output
@@ -50,6 +51,12 @@ python gpx_simplify.py -i voyage.gpx --max-ele-change 100
 
 # Drop waypoints, maximum debug output:
 python gpx_simplify.py -i voyage.gpx --no-waypoints -vvv
+
+# Find and interactively fill underway gaps (prompts for each gap):
+python gpx_simplify.py -i voyage.gpx --fix-gaps
+
+# Automatically fill all underway gaps without prompting:
+python gpx_simplify.py -i voyage.gpx --fix-gaps-auto
 ```
 
 ## Options
@@ -69,6 +76,8 @@ python gpx_simplify.py -i voyage.gpx --no-waypoints -vvv
 | `--split-gap HOURS` | `24` | Split output into separate segments at time gaps longer than this; use 0 to disable |
 | `--zerospd-window N` | `10` | Number of context points to examine on each side when evaluating a zero-speed step |
 | `--zerospd-max-dist KM` | `50` | Distance threshold (km) beyond which a zero-speed pair is treated as a ghost island and dropped |
+| `--fix-gaps` | off | Detect underway gaps and prompt to fill each one interactively |
+| `--fix-gaps-auto` | off | Detect and fill all underway gaps automatically without prompting (implies `--fix-gaps`) |
 | `--waypoints / --no-waypoints` | waypoints on | Copy waypoints to output |
 | `-v / -vv / -vvv` | quiet | Verbosity: info / debug / trace |
 | `--dry-run` | off | Parse and filter but do not write output |
@@ -101,6 +110,8 @@ python gpx_simplify.py -i voyage.gpx --no-waypoints -vvv
 **10. Deduplicate positions** — removes any output point whose latitude/longitude (rounded to 6 decimal places) is identical to the immediately preceding point. After rounding, adjacent fixes near the antimeridian can map to the same coordinate, producing zero-distance steps that cause errors in GPX viewers.
 
 **10b. Zero-speed ghost filter** — scans the deduplicated output for adjacent point pairs within 1 m of each other (zero apparent speed). For each such pair, it examines the `--zerospd-window` context points on each side, *excluding the pair itself*. If the pair's position is more than `--zerospd-max-dist` km (default 50) from every external neighbour, the pair is a geographically isolated ghost island — the signature of a ghost track segment that survived all earlier filters — and both points are dropped. Genuine stationary positions (boat at anchor) have local neighbours within a few kilometres and are not affected. Excluding both pair members from the neighbour set is essential: including the immediate predecessor would mask isolation, since two points at the same remote position are trivially 0 m apart.
+
+**10c. Gap detection and filling** *(optional — `--fix-gaps` or `--fix-gaps-auto`)* — walks the processed point list and identifies *underway gaps*: adjacent pairs where the time difference exceeds `--split-gap` hours **and** the vessel has moved (great-circle distance > 0 between the two points). Pure time-only gaps where the boat didn't move (e.g. an extended port call) are skipped — there is nothing to interpolate. For each underway gap, the tool prints the start and end time, duration, distance, and estimated fill speed (the mean of the average speed over the 10 output points immediately before and after the gap, clamped to 5 kn if no useful context exists). In interactive mode (`--fix-gaps`) the user is prompted for each gap; `--fix-gaps-auto` fills all gaps without prompting. Accepted gaps are filled with great-circle-interpolated points at `--min-distance` spacing, with timestamps distributed proportionally to distance. Inserted points are tagged with `source="interpolated"`.
 
 **11. Segment splitting** — before writing, splits the flat point list into separate track segments wherever the time gap between consecutive points exceeds `--split-gap` hours (default 24). GPX viewers draw a connecting line between every adjacent point in a segment; without splitting, a 15-month gap between passages produces a straight line across the Pacific that can cause O(n²) rendering or spatial-index hangs in some applications (including GPX Editor on macOS). Single-point segments and 2-point segments with total distance below 10 m are also dropped at this stage.
 
