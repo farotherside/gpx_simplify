@@ -182,6 +182,7 @@ class Stats:
     points_duptime_drop:    int = 0
     points_duppos_drop:     int = 0
     points_out:             int = 0
+    segments_out:           int = 0
     waypoints_in:           int = 0
     waypoints_out:          int = 0
     total_dist_km:          float = 0.0
@@ -928,22 +929,79 @@ def deduplicate_positions(
 
 
 # ── phase 9: write output ─────────────────────────────────────────────────────
+def split_into_segments(
+    points: list[Point],
+    split_gap_hours: float,
+    verbosity: int,
+    stats: Stats,
+) -> list[list[Point]]:
+    """
+    Split the flat point list into sub-lists wherever the time gap between
+    consecutive points exceeds split_gap_hours.
+
+    This restores the natural voyage-leg structure that the input file had as
+    separate track segments.  GPX viewers (including GPX Editor on macOS) draw
+    a connecting line between every adjacent point in a segment; without
+    splitting, a 15-month gap between two points produces a straight line drawn
+    across the entire Pacific, which can trigger O(n²) rendering or spatial-
+    index bugs and cause the application to hang.
+
+    Returns a list of segments (each segment is a list[Point]).
+    A split_gap_hours of 0 means no splitting — everything stays in one segment.
+    """
+    if split_gap_hours <= 0 or not points:
+        stats.segments_out = 1
+        return [points]
+
+    segments: list[list[Point]] = []
+    current: list[Point] = [points[0]]
+
+    for pt in points[1:]:
+        prev = current[-1]
+        if prev.time and pt.time:
+            dt_h = (pt.time - prev.time).total_seconds() / 3600.0
+            if dt_h > split_gap_hours:
+                segments.append(current)
+                log(
+                    VERBOSITY_DEBUG, verbosity, "debug",
+                    f"    segment break: gap {dt_h:.1f} h  "
+                    f"({prev.time} -> {pt.time})",
+                )
+                current = []
+        current.append(pt)
+
+    if current:
+        segments.append(current)
+
+    stats.segments_out = len(segments)
+    log(
+        VERBOSITY_INFO, verbosity, "info",
+        f"    Split into {len(segments):,} segment(s) "
+        f"(gap threshold: {split_gap_hours:.0f} h).",
+    )
+    return segments
+
+
 def write_gpx(
     out_path: Path,
     points: list[Point],
     waypoints: list,
     include_waypoints: bool,
+    split_gap_hours: float,
     source_path: Path,
     verbosity: int,
     stats: Stats,
 ) -> None:
     log(VERBOSITY_INFO, verbosity, "info", f"💾  Writing {out_path} …")
 
+    segments = split_into_segments(points, split_gap_hours, verbosity, stats)
+
     gpx_out = gpxpy.gpx.GPX()
     gpx_out.creator = "gpx_simplify.py"
     gpx_out.name = f"Simplified track from {source_path.name}"
     gpx_out.description = (
-        f"Processed {stats.points_in:,} input points -> {stats.points_out:,} output points. "
+        f"Processed {stats.points_in:,} input points -> {stats.points_out:,} output points "
+        f"in {stats.segments_out:,} segment(s). "
         f"Speed filter: dropped {stats.points_speed_drop:,}. "
         f"Longitude-jump filter: dropped {stats.points_lonjump_drop:,}. "
         f"Elevation filter: dropped {stats.points_ele_drop:,}. "
@@ -957,9 +1015,6 @@ def write_gpx(
     track.name = "Simplified Track"
     gpx_out.tracks.append(track)
 
-    segment = gpxpy.gpx.GPXTrackSegment()
-    track.segments.append(segment)
-
     with Progress(
         SpinnerColumn(),
         TextColumn("[info]Building output …"),
@@ -970,15 +1025,18 @@ def write_gpx(
         transient=True,
     ) as progress:
         task = progress.add_task("writing", total=len(points))
-        for pt in points:
-            tp = gpxpy.gpx.GPXTrackPoint(
-                latitude=round(pt.lat, 6),
-                longitude=round(pt.lon, 6),
-                elevation=round(pt.ele, 1) if pt.ele is not None else None,
-                time=pt.time,
-            )
-            segment.points.append(tp)
-            progress.advance(task)
+        for seg_points in segments:
+            segment = gpxpy.gpx.GPXTrackSegment()
+            track.segments.append(segment)
+            for pt in seg_points:
+                tp = gpxpy.gpx.GPXTrackPoint(
+                    latitude=round(pt.lat, 6),
+                    longitude=round(pt.lon, 6),
+                    elevation=round(pt.ele, 1) if pt.ele is not None else None,
+                    time=pt.time,
+                )
+                segment.points.append(tp)
+                progress.advance(task)
 
     if include_waypoints:
         for wp in waypoints:
@@ -1005,7 +1063,8 @@ def write_gpx(
 
     out_size = out_path.stat().st_size
     log(VERBOSITY_INFO, verbosity, "info",
-        f"    Written {out_size / 1_048_576:.2f} MB → {out_path}")
+        f"    Written {out_size / 1_048_576:.2f} MB  "
+        f"({stats.segments_out:,} segment(s)) → {out_path}")
 
 
 # ── summary table ─────────────────────────────────────────────────────────────
@@ -1033,6 +1092,7 @@ def print_summary(stats: Stats, in_path: Path, out_path: Path, dry_run: bool) ->
     table.add_row("Merge drops",       f"{stats.points_merge_drop:,}")
     table.add_row("Duplicate-time drops", f"{stats.points_duptime_drop:,}")
     table.add_row("Duplicate-position drops", f"{stats.points_duppos_drop:,}")
+    table.add_row("Segments out",      f"[good]{stats.segments_out:,}[/good]")
     table.add_row("Points out",       f"[good]{stats.points_out:,}[/good]")
     if stats.points_in:
         pct = (1 - stats.points_out / stats.points_in) * 100
@@ -1152,6 +1212,16 @@ Examples:
             "The filter stops early if a pass drops nothing. Default: 3"
         ),
     )
+    p.add_argument(
+        "--split-gap", type=float, default=24.0, metavar="HOURS",
+        help=(
+            "Split the output into separate track segments wherever the time gap "
+            "between consecutive points exceeds this many hours. Default: 24. "
+            "This prevents GPX viewers from drawing a straight connecting line "
+            "across multi-day or multi-month gaps (e.g. when the boat was in port). "
+            "Use 0 to disable splitting and write a single continuous segment."
+        ),
+    )
     wp_group = p.add_mutually_exclusive_group()
     wp_group.add_argument(
         "--waypoints", dest="waypoints", action="store_true", default=True,
@@ -1204,6 +1274,8 @@ def main() -> int:
             f"[info]Max cross-track:[/info]     {args.max_crosstrack:.0f} m\n"
             f"[info]Cross-track rate:[/info]    {args.max_crosstrack_rate:.0f} m/h\n"
             f"[info]Sanity passes:[/info]       {args.passes}\n"
+            f"[info]Split gap:[/info]           "
+            f"{args.split_gap:.0f} h{'  [dim](disabled)[/dim]' if args.split_gap <= 0 else ''}\n"
             f"[info]Waypoints:[/info]           {'yes' if args.waypoints else 'no'}\n"
             f"[info]Verbosity:[/info]           {verbosity} "
             f"({'quiet' if verbosity == 0 else 'info' if verbosity == 1 else 'debug' if verbosity == 2 else 'trace'})",
@@ -1259,7 +1331,8 @@ def main() -> int:
     points = deduplicate_positions(points, verbosity, stats)
 
     if not args.dry_run:
-        write_gpx(out_path, points, waypoints, args.waypoints, in_path, verbosity, stats)
+        write_gpx(out_path, points, waypoints, args.waypoints,
+                  args.split_gap, in_path, verbosity, stats)
     else:
         log(VERBOSITY_INFO, verbosity, "warn",
             "⚠  Dry run — output file not written.")
