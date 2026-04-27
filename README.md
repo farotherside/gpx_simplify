@@ -10,8 +10,11 @@ Built for a real-world use case: ten years of sailing across the Pacific, around
 
 - **Multi-source merge** — combines all tracks and segments from any number of sources, sorted chronologically into one unified track
 - **Speed anomaly filter** — drops points that imply physically impossible speeds (e.g. a sailboat "teleporting" across the ocean between two fixes)
+- **Antimeridian-safe centroid averaging** — cluster centroids near the date line (±180°) are computed using circular mean, preventing GPS fixes on opposite sides of the antimeridian from averaging to a point in the wrong hemisphere
+- **Longitude-jump filter** — catches GPS hemisphere-jumps (e.g. a fix at lon=-60° while crossing the date line near lon=±179°) that the speed filter may miss due to antimeridian wrapping; runs after decimation
 - **Elevation spike filter** — drops points whose altitude differs from the previous point by more than a configurable threshold (default 50 m); GPS elevation noise on a boat should never produce sudden multi-metre jumps
 - **Distance decimation** — reduces point density to a target spacing in metres, averaging clusters of nearby points into a centroid rather than simply discarding them
+- **Duplicate-position deduplication** — removes adjacent output points that map to the same rounded coordinate (prevents zero-distance steps in GPX viewers)
 - **Waypoint passthrough** — optionally copies all named waypoints from the input to the output
 - **Rich terminal UI** — colour output, animated progress bars, and a summary table; multiple verbosity levels for debugging
 - **Dry-run mode** — analyse without writing any output
@@ -52,9 +55,10 @@ python gpx_simplify.py -i voyage.gpx --no-waypoints -vvv
 |---|---|---|
 | `-i / --input FILE` | *(required)* | Input GPX file |
 | `-o / --output FILE` | `<input>_simplified.gpx` | Output GPX file |
-| `-d / --min-distance METRES` | `100` | Minimum distance between output points |
+| `-d / --min-distance METRES` | `1000` | Minimum distance between output points |
 | `-m / --merge-distance METRES` | `100` | Points closer than this to the last emitted point are merged |
 | `-s / --max-speed KNOTS` | `50` | Speed above which a point is treated as a GPS error |
+| `--max-lon-jump DEGREES` | `90` | Max longitude difference (°) between a point and both its neighbours; catches antimeridian GPS glitches |
 | `--max-ele-change METRES` | `50` | Max elevation change between adjacent points; larger jumps are dropped as sensor noise |
 | `--max-crosstrack METRES` | `1000` | Max perpendicular deviation from the prev→next line before a point is an outlier |
 | `--max-crosstrack-rate M_PER_HOUR` | `93000` | Rate guard for the cross-track filter — keeps legitimate self-crossing tracks |
@@ -75,11 +79,17 @@ python gpx_simplify.py -i voyage.gpx --no-waypoints -vvv
 
 **5. Cross-track filter (iterative)** — for each interior point, computes its perpendicular distance from the great-circle line between its two neighbours. If the deviation exceeds `--max-crosstrack` *and* the deviation-per-hour exceeds `--max-crosstrack-rate`, the point is dropped as a GPS jump. The rate guard uses the *minimum* of the two leg gaps so a spike 2 minutes from one neighbour is caught even if the other is hours away. Runs up to `--passes` times, stopping early when a pass drops nothing.
 
-**6. Decimate** — walks the filtered list, accumulating nearby points into clusters. When the accumulated distance from the last emitted point reaches `--min-distance`, the centroid of the current cluster is emitted as one output point. This averages overlapping fixes from multiple sources rather than arbitrarily picking one.
+**6. Decimate** — walks the filtered list, accumulating nearby points into clusters. When the accumulated distance from the last emitted point reaches `--min-distance`, the centroid of the current cluster is emitted as one output point. Longitude is averaged using the circular mean (unit-vector method) so clusters near the antimeridian (±180°) are correctly averaged across the date line rather than collapsing to the wrong hemisphere.
 
-**7. Deduplicate timestamps** — removes any output point whose timestamp is identical to the immediately preceding point. This can occur when two source tracks both have a fix at the same clock second but at different positions; both survive the distance filter but would appear as adjacent points with a zero time delta, causing divide-by-zero errors in speed/heading calculations in downstream tools.
+**7. Elevation filter** — scrubs implausible elevation values from the decimated list, nulling out the altitude for any point whose elevation differs from the previous clean value by more than `--max-ele-change`. The position is kept; only the altitude tag is removed.
 
-**8. Write** — writes a clean GPX 1.1 file with a single track segment and optional waypoints. The `xsi:schemaLocation` attribute that gpxpy normally includes is stripped from the output — some applications (including GPX Editor on macOS) attempt to fetch the referenced XSD from the network on load, which causes a hang if the request is slow or firewalled. Output coordinates are rounded to 6 decimal places (~11 cm precision).
+**8. Longitude-jump filter** — walks the decimated output and drops any point whose longitude differs from *both* its neighbours by more than `--max-lon-jump` degrees. Running after decimation catches rare antimeridian glitches that survive earlier filters because haversine wraps distances across ±180°.
+
+**9. Deduplicate timestamps** — removes any output point whose timestamp is identical to the immediately preceding point. This can occur when two source tracks both have a fix at the same clock second but at different positions; both survive the distance filter but would appear as adjacent points with a zero time delta, causing divide-by-zero errors in speed/heading calculations in downstream tools.
+
+**10. Deduplicate positions** — removes any output point whose latitude/longitude (rounded to 6 decimal places) is identical to the immediately preceding point. After rounding, adjacent fixes near the antimeridian can map to the same coordinate, producing zero-distance steps that cause errors in GPX viewers.
+
+**11. Write** — writes a clean GPX 1.1 file with a single track segment and optional waypoints. The `xsi:schemaLocation` attribute that gpxpy normally includes is stripped from the output — some applications (including GPX Editor on macOS) attempt to fetch the referenced XSD from the network on load, which causes a hang if the request is slow or firewalled. Output coordinates are rounded to 6 decimal places (~11 cm precision).
 
 ## Example output
 
