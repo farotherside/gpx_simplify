@@ -225,6 +225,7 @@ class Stats:
     points_gap_fill:        int = 0
     gaps_found:             int = 0
     gaps_filled:            int = 0
+    segments_merged:        int = 0
     points_out:             int = 0
     segments_out:           int = 0
     waypoints_in:           int = 0
@@ -1808,12 +1809,86 @@ def split_into_segments(
     return segments
 
 
+def segment_distance_nm(seg: list[Point]) -> float:
+    """Return the total great-circle distance of a segment in nautical miles."""
+    total = 0.0
+    for a, b in zip(seg[:-1], seg[1:]):
+        total += haversine_m(a.lat, a.lon, b.lat, b.lon)
+    return total / 1852.0
+
+
+def merge_short_segments(
+    segments: list[list[Point]],
+    min_nm: float,
+    verbosity: int,
+    stats: Stats,
+) -> list[list[Point]]:
+    """
+    Merge any segment shorter than `min_nm` nautical miles into its
+    chronological predecessor (or successor if it's the first segment).
+
+    Merging is iterative: after each pass, newly-merged segments may
+    themselves be short and need merging with their neighbours. Stops
+    when no segment in the list is shorter than `min_nm`.
+
+    A segment that is short AND has no neighbour (i.e. it's the only
+    segment) is left as-is — there is nothing to merge into.
+    """
+    if len(segments) <= 1:
+        return segments
+
+    log(VERBOSITY_INFO, verbosity, "info",
+        f"🔀  Merging segments shorter than {min_nm:.0f} nm …")
+
+    changed = True
+    while changed:
+        changed = False
+        result: list[list[Point]] = []
+        i = 0
+        while i < len(segments):
+            seg = segments[i]
+            dist = segment_distance_nm(seg)
+            if dist < min_nm and len(segments) > 1:
+                # Merge into predecessor if one exists, else into successor.
+                if result:
+                    # Append to the last kept segment.
+                    merged = result[-1] + seg
+                    result[-1] = merged
+                    log(VERBOSITY_DEBUG, verbosity, "debug",
+                        f"    merge seg[{i}]  ({dist:.1f} nm) → predecessor  "
+                        f"(now {segment_distance_nm(result[-1]):.1f} nm)")
+                else:
+                    # No predecessor yet — absorb the next segment instead.
+                    if i + 1 < len(segments):
+                        merged = seg + segments[i + 1]
+                        result.append(merged)
+                        log(VERBOSITY_DEBUG, verbosity, "debug",
+                            f"    merge seg[{i}]  ({dist:.1f} nm) → successor  "
+                            f"(now {segment_distance_nm(merged):.1f} nm)")
+                        i += 1   # skip the successor we just absorbed
+                    else:
+                        result.append(seg)   # only segment, leave it
+                stats.segments_merged += 1
+                changed = True
+            else:
+                result.append(seg)
+            i += 1
+        segments = result
+
+    n_merged = stats.segments_merged
+    log(VERBOSITY_INFO, verbosity, "info",
+        f"    {n_merged:,} segment(s) merged.  {len(segments):,} segment(s) remain.")
+    return segments
+
+
 def write_gpx(
     out_path: Path,
     points: list[Point],
     waypoints: list,
     include_waypoints: bool,
     split_gap_hours: float,
+    split_tracks: bool,
+    merge_short_nm: float,
     source_path: Path,
     verbosity: int,
     stats: Stats,
@@ -1821,6 +1896,11 @@ def write_gpx(
     log(VERBOSITY_INFO, verbosity, "info", f"💾  Writing {out_path} …")
 
     segments = split_into_segments(points, split_gap_hours, verbosity, stats)
+
+    if merge_short_nm > 0:
+        segments = merge_short_segments(segments, merge_short_nm, verbosity, stats)
+        # Re-count after merging (split_into_segments set this earlier)
+        stats.segments_out = len(segments)
 
     gpx_out = gpxpy.gpx.GPX()
     gpx_out.creator = "gpx_simplify.py"
@@ -1837,9 +1917,12 @@ def write_gpx(
         f"Duplicate-position drops: {stats.points_duppos_drop:,}."
     )
 
-    track = gpxpy.gpx.GPXTrack()
-    track.name = "Simplified Track"
-    gpx_out.tracks.append(track)
+    def seg_date_name(seg: list[Point]) -> str:
+        """Return YYYYMMDD from the first timestamped point in a segment."""
+        for pt in seg:
+            if pt.time is not None:
+                return pt.time.strftime("%Y%m%d")
+        return "unknown"
 
     with Progress(
         SpinnerColumn(),
@@ -1851,18 +1934,41 @@ def write_gpx(
         transient=True,
     ) as progress:
         task = progress.add_task("writing", total=len(points))
-        for seg_points in segments:
-            segment = gpxpy.gpx.GPXTrackSegment()
-            track.segments.append(segment)
-            for pt in seg_points:
-                tp = gpxpy.gpx.GPXTrackPoint(
-                    latitude=round(pt.lat, 6),
-                    longitude=round(pt.lon, 6),
-                    elevation=round(pt.ele, 1) if pt.ele is not None else None,
-                    time=pt.time,
-                )
-                segment.points.append(tp)
-                progress.advance(task)
+
+        if split_tracks:
+            # Each segment becomes its own <trk> named YYYYMMDD.
+            for seg_points in segments:
+                track = gpxpy.gpx.GPXTrack()
+                track.name = seg_date_name(seg_points)
+                gpx_out.tracks.append(track)
+                segment = gpxpy.gpx.GPXTrackSegment()
+                track.segments.append(segment)
+                for pt in seg_points:
+                    tp = gpxpy.gpx.GPXTrackPoint(
+                        latitude=round(pt.lat, 6),
+                        longitude=round(pt.lon, 6),
+                        elevation=round(pt.ele, 1) if pt.ele is not None else None,
+                        time=pt.time,
+                    )
+                    segment.points.append(tp)
+                    progress.advance(task)
+        else:
+            # All segments in a single <trk>.
+            track = gpxpy.gpx.GPXTrack()
+            track.name = "Simplified Track"
+            gpx_out.tracks.append(track)
+            for seg_points in segments:
+                segment = gpxpy.gpx.GPXTrackSegment()
+                track.segments.append(segment)
+                for pt in seg_points:
+                    tp = gpxpy.gpx.GPXTrackPoint(
+                        latitude=round(pt.lat, 6),
+                        longitude=round(pt.lon, 6),
+                        elevation=round(pt.ele, 1) if pt.ele is not None else None,
+                        time=pt.time,
+                    )
+                    segment.points.append(tp)
+                    progress.advance(task)
 
     if include_waypoints:
         for wp in waypoints:
@@ -1926,6 +2032,8 @@ def print_summary(stats: Stats, in_path: Path, out_path: Path, dry_run: bool) ->
         table.add_row("Underway gaps found",  f"[warn]{stats.gaps_found:,}[/warn]")
         table.add_row("Gaps filled",          f"[good]{stats.gaps_filled:,}[/good]")
         table.add_row("Gap-fill points added",f"[good]{stats.points_gap_fill:,}[/good]")
+    if stats.segments_merged:
+        table.add_row("Short segments merged", f"{stats.segments_merged:,}")
     table.add_row("Segments out",      f"[good]{stats.segments_out:,}[/good]")
     table.add_row("Points out",       f"[good]{stats.points_out:,}[/good]")
     if stats.points_in:
@@ -2054,6 +2162,23 @@ Examples:
             "This prevents GPX viewers from drawing a straight connecting line "
             "across multi-day or multi-month gaps (e.g. when the boat was in port). "
             "Use 0 to disable splitting and write a single continuous segment."
+        ),
+    )
+    p.add_argument(
+        "--split-tracks", action="store_true", default=False,
+        help=(
+            "Write each output segment as a separate GPX track (<trk>) rather "
+            "than as segments within a single track.  Each track is named with "
+            "the date its first point falls on, in YYYYMMDD format."
+        ),
+    )
+    p.add_argument(
+        "--merge-short", type=float, default=50.0, metavar="NM",
+        help=(
+            "After segmenting, merge any segment shorter than this many nautical "
+            "miles into its chronological predecessor (or successor if it is the "
+            "first segment).  Repeated until no short segments remain.  "
+            "Default: 50 nm.  Set to 0 to disable merging."
         ),
     )
     p.add_argument(
@@ -2226,7 +2351,8 @@ def main() -> int:
 
     if not args.dry_run:
         write_gpx(out_path, points, waypoints, args.waypoints,
-                  args.split_gap, in_path, verbosity, stats)
+                  args.split_gap, args.split_tracks, args.merge_short,
+                  in_path, verbosity, stats)
     else:
         log(VERBOSITY_INFO, verbosity, "warn",
             "⚠  Dry run — output file not written.")
