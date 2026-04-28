@@ -492,55 +492,75 @@ def filter_speed_anomalies(
             else:
                 impossible = False
 
-            # Cross-context impossibility check.
+            # Dropped-predecessor impossibility check.
             #
-            # The standard impossible-distance check above uses kept[-1] for BOTH
-            # position and time.  This fails when kept[-1] is months/years old:
-            # max_plausible_m becomes enormous and even a 1000 km ghost looks
+            # The standard impossible-distance check uses kept[-1] for BOTH position
+            # and time.  This fails for ghost clusters where kept[-1] is months or
+            # years old: max_plausible_m becomes enormous and a 3000 km ghost looks
             # reachable.
             #
-            # A ghost cluster has a different temporal signature: all of the ghost
-            # points share timestamps that are very close to each other (seconds or
-            # minutes apart) even though their *position* is thousands of km from the
-            # real track.  The most recently seen timestamp in the raw array is
-            # prev_raw.time — it is close to cur.time.  The last *known good position*
-            # is prev (= kept[-1]).
+            # The ghost cluster scenario:
+            #   - prev_raw (points[i-1]) was itself a ghost and was DROPPED
+            #   - prev_raw.time is very close to cur.time (seconds apart)
+            #   - kept[-1].time is months/years earlier
             #
-            # Combining them: if the distance from the last kept position to cur
-            # is impossible given only the elapsed time since the most recent raw
-            # predecessor, cur is a ghost.
+            # Fix: when prev_raw was dropped, use prev_raw.time as the elapsed-time
+            # reference (tight, seconds) while keeping kept[-1]'s position as the
+            # "where was the boat?" anchor.  A real boat cannot travel from kept[-1]
+            # to cur in the few seconds between prev_raw and cur.
             #
-            # Edge case 1: prev_raw IS prev (nothing was dropped between them) — this
-            # reduces to the standard check above, which already ran; skip.
-            #
-            # Edge case 2: prev_raw was also a ghost at the same location as cur →
-            # both prev_raw.time and cur.time are recent, but actual_m (kept[-1] to
-            # cur) is still huge.  This check catches that case.
+            # Why this is safe for legitimate dropped points:
+            #   - A normal noise-spike dropped in the normal branch has a prev_raw
+            #     that is only slightly displaced from the real track; cur is also on
+            #     the real track.  The distance from kept[-1] to cur is small (the
+            #     boat barely moved in those seconds) → check does not fire.
+            #   - A dropout resumption where a zero-dt duplicate was dropped is
+            #     handled by the zero-dt branch above, never reaching this code.
+            #     After that, kept[-1] is the just-resumed point (fresh), so the
+            #     standard check handles subsequent normal points correctly.
+            #   - A dropout resumption where the dropped predecessor had dt > 0:
+            #     prev_raw.time is close to cur.time AND kept[-1].time is also close
+            #     (the dropout is a gap in data, not a gap in kept[]).  Wait — if
+            #     kept[-1] is old (e.g. 2h ago) and prev_raw.time ≈ cur.time, then
+            #     dist(kept[-1]→cur) could be ~72 km while max_plausible ≈ 50 m.
+            #     To guard this: only apply when dist(kept[-1]→cur) also exceeds
+            #     the STANDARD max_plausible (i.e. the normal check would have
+            #     caught it if not for the stale time).  In other words, require
+            #     that the normal check failed only because dt_s was too large, not
+            #     because the distance is genuinely OK.
+            #     Concretely: the point is suspicious only when it is impossible
+            #     relative to prev_raw.time AND also impossible relative to kept[-1]
+            #     if we tighten the time to prev_raw.time.  For a legit 2h-dropout
+            #     point, dt_s (kept[-1] to prev_raw) is 2h, max_plausible is 74 km,
+            #     actual is 72 km → the STANDARD check barely passes.  Adding the
+            #     tighter constraint would wrongly drop it.  Guard: only fire when
+            #     the standard dt_s (kept[-1] to cur) itself already gives a very
+            #     large budget (> _STALE_BUDGET_M) — meaning kept[-1] is truly stale.
+            _STALE_BUDGET_M = 500_000  # 500 km — only act when budget is enormous
             if (not impossible
-                    and prev_raw is not prev
+                    and (i - 1) not in _kept_indices
                     and prev_raw.time is not None
                     and cur.time is not None
                     and prev.time is not None):
-                # Use the MINIMUM elapsed time between prev_raw→cur and prev→cur.
-                # prev_raw.time is the most recent timestamp seen; prev.time is the
-                # timestamp of the last accepted point.  For ghost clusters,
-                # prev_raw.time ≈ cur.time so dt_cross_s is tiny, making
-                # max_plausible_cross_m small and the check tight.
-                dt_cross_s = min(
-                    abs((cur.time - prev_raw.time).total_seconds()),
-                    abs((cur.time - prev.time).total_seconds()),
-                )
-                if dt_cross_s > 0:
-                    max_plausible_cross_m = (max_speed_knots / 1.94384) * dt_cross_s
-                    actual_m_from_prev = haversine_m(prev.lat, prev.lon, cur.lat, cur.lon)
-                    if actual_m_from_prev > max_plausible_cross_m:
-                        impossible = True
-                        log(VERBOSITY_DEBUG, verbosity, "debug",
-                            f"    impossible (cross-context)  [{cur.source}] "
-                            f"{cur.lat:.5f},{cur.lon:.5f}  "
-                            f"d_from_kept={actual_m_from_prev/1000:.0f}km  "
-                            f"max={max_plausible_cross_m/1000:.1f}km  "
-                            f"dt_cross={dt_cross_s:.0f}s")
+                dt_s_normal = abs((cur.time - prev.time).total_seconds())
+                normal_budget_m = (max_speed_knots / 1.94384) * dt_s_normal
+                if normal_budget_m > _STALE_BUDGET_M:
+                    # kept[-1] is genuinely stale — apply tighter check
+                    dt_raw_s = abs((cur.time - prev_raw.time).total_seconds())
+                    if dt_raw_s > 0:
+                        max_plausible_tight_m = (max_speed_knots / 1.94384) * dt_raw_s
+                        actual_m_from_prev = haversine_m(
+                            prev.lat, prev.lon, cur.lat, cur.lon
+                        )
+                        if actual_m_from_prev > max_plausible_tight_m:
+                            impossible = True
+                            log(VERBOSITY_DEBUG, verbosity, "debug",
+                                f"    impossible (dropped-pred)  [{cur.source}] "
+                                f"{cur.lat:.5f},{cur.lon:.5f}  "
+                                f"d_from_kept={actual_m_from_prev/1000:.0f}km  "
+                                f"max={max_plausible_tight_m/1000:.3f}km  "
+                                f"dt_raw={dt_raw_s:.0f}s  "
+                                f"normal_budget={normal_budget_m/1000:.0f}km")
 
             # s_to_next is None when:
             #   (a) nxt has no timestamp → genuinely unknown → be conservative, keep
