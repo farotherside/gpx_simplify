@@ -492,33 +492,55 @@ def filter_speed_anomalies(
             else:
                 impossible = False
 
-            # Also check impossibility against the raw predecessor in the sorted
-            # array (prev_raw), regardless of whether it was kept or dropped.
+            # Cross-context impossibility check.
             #
-            # When prev_raw is a ghost that was itself dropped, kept[-1] may be
-            # from far back in time, making dt_s huge and the impossible check
-            # above toothless (a 20-knot boat CAN cover 1000 km given months).
-            # But the ghost's raw predecessor is only seconds or minutes away —
-            # if the current point is impossibly far from THAT, it is also a ghost.
+            # The standard impossible-distance check above uses kept[-1] for BOTH
+            # position and time.  This fails when kept[-1] is months/years old:
+            # max_plausible_m becomes enormous and even a 1000 km ghost looks
+            # reachable.
             #
-            # We only apply this when prev_raw differs from prev (i.e. prev_raw
-            # was dropped) and both have valid timestamps.
+            # A ghost cluster has a different temporal signature: all of the ghost
+            # points share timestamps that are very close to each other (seconds or
+            # minutes apart) even though their *position* is thousands of km from the
+            # real track.  The most recently seen timestamp in the raw array is
+            # prev_raw.time — it is close to cur.time.  The last *known good position*
+            # is prev (= kept[-1]).
+            #
+            # Combining them: if the distance from the last kept position to cur
+            # is impossible given only the elapsed time since the most recent raw
+            # predecessor, cur is a ghost.
+            #
+            # Edge case 1: prev_raw IS prev (nothing was dropped between them) — this
+            # reduces to the standard check above, which already ran; skip.
+            #
+            # Edge case 2: prev_raw was also a ghost at the same location as cur →
+            # both prev_raw.time and cur.time are recent, but actual_m (kept[-1] to
+            # cur) is still huge.  This check catches that case.
             if (not impossible
                     and prev_raw is not prev
                     and prev_raw.time is not None
-                    and cur.time is not None):
-                dt_raw_s = abs((cur.time - prev_raw.time).total_seconds())
-                if dt_raw_s > 0:
-                    max_plausible_raw_m = (max_speed_knots / 1.94384) * dt_raw_s
-                    actual_raw_m = haversine_m(prev_raw.lat, prev_raw.lon, cur.lat, cur.lon)
-                    if actual_raw_m > max_plausible_raw_m:
+                    and cur.time is not None
+                    and prev.time is not None):
+                # Use the MINIMUM elapsed time between prev_raw→cur and prev→cur.
+                # prev_raw.time is the most recent timestamp seen; prev.time is the
+                # timestamp of the last accepted point.  For ghost clusters,
+                # prev_raw.time ≈ cur.time so dt_cross_s is tiny, making
+                # max_plausible_cross_m small and the check tight.
+                dt_cross_s = min(
+                    abs((cur.time - prev_raw.time).total_seconds()),
+                    abs((cur.time - prev.time).total_seconds()),
+                )
+                if dt_cross_s > 0:
+                    max_plausible_cross_m = (max_speed_knots / 1.94384) * dt_cross_s
+                    actual_m_from_prev = haversine_m(prev.lat, prev.lon, cur.lat, cur.lon)
+                    if actual_m_from_prev > max_plausible_cross_m:
                         impossible = True
                         log(VERBOSITY_DEBUG, verbosity, "debug",
-                            f"    impossible vs raw_prev  [{cur.source}] "
+                            f"    impossible (cross-context)  [{cur.source}] "
                             f"{cur.lat:.5f},{cur.lon:.5f}  "
-                            f"d_raw={actual_raw_m/1000:.0f}km  "
-                            f"max={max_plausible_raw_m/1000:.1f}km  "
-                            f"dt={dt_raw_s:.0f}s")
+                            f"d_from_kept={actual_m_from_prev/1000:.0f}km  "
+                            f"max={max_plausible_cross_m/1000:.1f}km  "
+                            f"dt_cross={dt_cross_s:.0f}s")
 
             # s_to_next is None when:
             #   (a) nxt has no timestamp → genuinely unknown → be conservative, keep
