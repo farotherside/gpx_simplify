@@ -492,6 +492,34 @@ def filter_speed_anomalies(
             else:
                 impossible = False
 
+            # Also check impossibility against the raw predecessor in the sorted
+            # array (prev_raw), regardless of whether it was kept or dropped.
+            #
+            # When prev_raw is a ghost that was itself dropped, kept[-1] may be
+            # from far back in time, making dt_s huge and the impossible check
+            # above toothless (a 20-knot boat CAN cover 1000 km given months).
+            # But the ghost's raw predecessor is only seconds or minutes away —
+            # if the current point is impossibly far from THAT, it is also a ghost.
+            #
+            # We only apply this when prev_raw differs from prev (i.e. prev_raw
+            # was dropped) and both have valid timestamps.
+            if (not impossible
+                    and prev_raw is not prev
+                    and prev_raw.time is not None
+                    and cur.time is not None):
+                dt_raw_s = abs((cur.time - prev_raw.time).total_seconds())
+                if dt_raw_s > 0:
+                    max_plausible_raw_m = (max_speed_knots / 1.94384) * dt_raw_s
+                    actual_raw_m = haversine_m(prev_raw.lat, prev_raw.lon, cur.lat, cur.lon)
+                    if actual_raw_m > max_plausible_raw_m:
+                        impossible = True
+                        log(VERBOSITY_DEBUG, verbosity, "debug",
+                            f"    impossible vs raw_prev  [{cur.source}] "
+                            f"{cur.lat:.5f},{cur.lon:.5f}  "
+                            f"d_raw={actual_raw_m/1000:.0f}km  "
+                            f"max={max_plausible_raw_m/1000:.1f}km  "
+                            f"dt={dt_raw_s:.0f}s")
+
             # s_to_next is None when:
             #   (a) nxt has no timestamp → genuinely unknown → be conservative, keep
             #   (b) cur and nxt share the same timestamp (dt=0) → degenerate step,
