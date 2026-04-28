@@ -1271,7 +1271,47 @@ def filter_zero_speed_ghosts(
 # ── reverse geocoding (Nominatim / OpenStreetMap) ─────────────────────────────
 _NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
 _NOMINATIM_UA  = "gpx_simplify/1.0 (sailing track tool; contact via github.com/farotherside/gpx_simplify)"
-_geocode_cache: dict[tuple[float, float], str] = {}
+_geocode_cache:      dict[tuple[float, float], str]  = {}   # full description
+_geocode_addr_cache: dict[tuple[float, float], dict] = {}   # raw address dict
+
+# Country name abbreviations for short labels
+_COUNTRY_ABBREV: dict[str, str] = {
+    "United States": "USA",
+    "United Kingdom": "UK",
+    "New Zealand": "NZ",
+    "Papua New Guinea": "PNG",
+}
+
+
+def _fetch_nominatim(lat: float, lon: float, timeout: float = 5.0) -> dict:
+    """
+    Fetch the raw Nominatim JSON for (lat, lon).  Returns {} on any error.
+    Results are cached by 0.01° grid cell.
+    """
+    cache_key = (round(lat, 2), round(lon, 2))
+    if cache_key in _geocode_addr_cache:
+        return _geocode_addr_cache[cache_key]
+
+    params = urllib.parse.urlencode({
+        "lat": f"{lat:.6f}",
+        "lon": f"{lon:.6f}",
+        "format": "jsonv2",
+        "zoom": 10,
+        "addressdetails": 1,
+        "accept-language": "en",
+    })
+    try:
+        req = urllib.request.Request(
+            f"{_NOMINATIM_URL}?{params}",
+            headers={"User-Agent": _NOMINATIM_UA},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        data = {}
+
+    _geocode_addr_cache[cache_key] = data
+    return data
 
 
 def reverse_geocode(lat: float, lon: float, timeout: float = 5.0) -> str:
@@ -1279,45 +1319,25 @@ def reverse_geocode(lat: float, lon: float, timeout: float = 5.0) -> str:
     Return a human-readable location description for (lat, lon) using the
     Nominatim reverse-geocoding API (OpenStreetMap).
 
-    The result is a short, landmark-first string built from the response's
-    address fields, e.g.:
+    The result is a landmark-first string, e.g.:
         "Watsons Bay, Sydney, New South Wales, Australia"
-        "Tasman Sea (~480 km E of Sydney)"   ← ocean fallback
-        "13.4521°N, 144.7937°E"              ← network-error fallback
+        "13.4521°N, 144.7937°E"   ← open-ocean / network-error fallback
 
-    Results are cached by rounded coordinate (0.01°) so repeated lookups
-    for nearby points don't hammer the API.  A polite User-Agent is sent
-    as required by Nominatim's usage policy.
+    Results are cached by 0.01° grid cell.
     """
     cache_key = (round(lat, 2), round(lon, 2))
     if cache_key in _geocode_cache:
         return _geocode_cache[cache_key]
 
-    params = urllib.parse.urlencode({
-        "lat": f"{lat:.6f}",
-        "lon": f"{lon:.6f}",
-        "format": "jsonv2",
-        "zoom": 10,          # city / suburb level
-        "addressdetails": 1,
-        "accept-language": "en",
-    })
-    url = f"{_NOMINATIM_URL}?{params}"
-
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": _NOMINATIM_UA})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception:
-        # Network error, rate-limit, or JSON parse failure — fall back to coords.
-        result = f"{abs(lat):.4f}°{'N' if lat >= 0 else 'S'}, {abs(lon):.4f}°{'E' if lon >= 0 else 'W'}"
-        _geocode_cache[cache_key] = result
-        return result
-
-    addr = data.get("address", {})
+    data    = _fetch_nominatim(lat, lon, timeout)
+    addr    = data.get("address", {})
     display = data.get("display_name", "")
 
-    # Build a concise landmark-first description from available address fields.
-    # Priority: named place / suburb / town → city/county → state → country.
+    coord_fallback = (
+        f"{abs(lat):.4f}°{'N' if lat >= 0 else 'S'}, "
+        f"{abs(lon):.4f}°{'E' if lon >= 0 else 'W'}"
+    )
+
     parts: list[str] = []
     for key in ("tourism", "amenity", "leisure", "natural", "hamlet",
                 "village", "suburb", "quarter", "neighbourhood",
@@ -1338,27 +1358,62 @@ def reverse_geocode(lat: float, lon: float, timeout: float = 5.0) -> str:
     if parts:
         result = ", ".join(parts)
     elif display:
-        # Nominatim returned something but address fields were empty — use the
-        # display_name but trim it to the first 3 comma-separated tokens.
         tokens = [t.strip() for t in display.split(",")]
         result = ", ".join(tokens[:3])
     else:
-        result = f"{abs(lat):.4f}°{'N' if lat >= 0 else 'S'}, {abs(lon):.4f}°{'E' if lon >= 0 else 'W'}"
+        result = coord_fallback
 
     _geocode_cache[cache_key] = result
     return result
 
 
+def short_location_name(lat: float, lon: float, timeout: float = 5.0) -> str:
+    """
+    Return a brief "City, Country" label suitable for track descriptions, e.g.:
+        "Victoria, Canada"
+        "Port Angeles, USA"
+        "Sydney, Australia"
+        "Port Vila, Vanuatu"
+        "10.0000°S, 165.0000°E"   ← open-ocean fallback
+
+    Uses the Nominatim address dict.  Country names are abbreviated via
+    _COUNTRY_ABBREV where appropriate.
+    """
+    data = _fetch_nominatim(lat, lon, timeout)
+    addr = data.get("address", {})
+
+    if not addr:
+        return (f"{abs(lat):.4f}°{'N' if lat >= 0 else 'S'}, "
+                f"{abs(lon):.4f}°{'E' if lon >= 0 else 'W'}")
+
+    # City-level name: prefer city > town > village > hamlet > municipality
+    city = (addr.get("city") or addr.get("town") or addr.get("village")
+            or addr.get("hamlet") or addr.get("municipality")
+            or addr.get("county") or addr.get("state"))
+
+    country_full = addr.get("country", "")
+    country = _COUNTRY_ABBREV.get(country_full, country_full)
+
+    if city and country:
+        return f"{city}, {country}"
+    elif city:
+        return city
+    elif country:
+        return country
+    else:
+        return (f"{abs(lat):.4f}°{'N' if lat >= 0 else 'S'}, "
+                f"{abs(lon):.4f}°{'E' if lon >= 0 else 'W'}")
+
+
 def location_label(lat: float, lon: float) -> str:
     """
-    Return a combined coordinate + landmark string for display, e.g.:
-        -33.8568°, 151.2153° (Watsons Bay, Sydney, New South Wales, Australia)
-    Falls back to just the coordinate string if geocoding fails silently.
+    Return a combined coordinate + landmark string for gap prompts, e.g.:
+        33.8568°S, 151.2153°E  (Sydney, New South Wales, Australia)
+    Falls back to just coordinates if geocoding fails.
     """
     coord = (f"{abs(lat):.4f}°{'N' if lat >= 0 else 'S'}, "
              f"{abs(lon):.4f}°{'E' if lon >= 0 else 'W'}")
     place = reverse_geocode(lat, lon)
-    # If place IS the coordinate (fallback), don't duplicate it.
     if place.startswith(coord[:6]):
         return coord
     return f"{coord}  ({place})"
@@ -1936,11 +1991,31 @@ def write_gpx(
         task = progress.add_task("writing", total=len(points))
 
         if split_tracks:
-            # Each segment becomes its own <trk> named YYYYMMDD.
-            for seg_points in segments:
+            # Each segment becomes its own <trk> with:
+            #   name        = YYYYMMDD (date of first point)
+            #   number      = 1-based sequential track number
+            #   comment     = distance in nautical miles, e.g. "142.3 nm"
+            #   description = "From, Country to To, Country"
+            for track_num, seg_points in enumerate(segments, start=1):
+                dist_nm = segment_distance_nm(seg_points)
+
+                # Geocode first and last points for the description.
+                first_pt = seg_points[0]
+                last_pt  = seg_points[-1]
+                from_name = short_location_name(first_pt.lat, first_pt.lon)
+                to_name   = short_location_name(last_pt.lat,  last_pt.lon)
+                if from_name == to_name:
+                    desc = from_name
+                else:
+                    desc = f"{from_name} to {to_name}"
+
                 track = gpxpy.gpx.GPXTrack()
-                track.name = seg_date_name(seg_points)
+                track.name        = seg_date_name(seg_points)
+                track.number      = track_num
+                track.comment     = f"{dist_nm:.1f} nm"
+                track.description = desc
                 gpx_out.tracks.append(track)
+
                 segment = gpxpy.gpx.GPXTrackSegment()
                 track.segments.append(segment)
                 for pt in seg_points:
@@ -1952,6 +2027,8 @@ def write_gpx(
                     )
                     segment.points.append(tp)
                     progress.advance(task)
+                log(VERBOSITY_DEBUG, verbosity, "debug",
+                    f"    track {track_num}: {track.name}  {dist_nm:.1f} nm  {desc}")
         else:
             # All segments in a single <trk>.
             track = gpxpy.gpx.GPXTrack()
