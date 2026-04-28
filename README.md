@@ -19,6 +19,8 @@ Built for a real-world use case: ten years of sailing across the Pacific, around
 - **Duplicate-position deduplication** — removes adjacent output points that map to the same rounded coordinate (prevents zero-distance steps in GPX viewers)
 - **Segment splitting** — splits the output into separate track segments wherever the time gap between consecutive points exceeds a configurable threshold (default 24 h); prevents GPX viewers from drawing straight lines across multi-day gaps between passages
 - **Small-gap bridging** — automatically fills any gap between adjacent output points smaller than 0.5 nm (926 m) with great-circle-interpolated points at `--min-distance` spacing. These are GPS logger dropouts — brief pauses that leave a visible nick in the rendered track. Runs silently during processing with no user interaction required. Bridged points are tagged `source="bridged"`.
+- **Per-segment tracks** — `--split-tracks` writes each output segment as its own GPX `<trk>` element named with the date of the segment's first point (`YYYYMMDD`), making the track library easy to browse by leg
+- **Short-segment merging** — `--merge-short` (default 50 nm) merges stub segments into their chronological neighbour, iterating until all remaining segments meet the minimum length. Catches brief GPS-on periods that would otherwise produce isolated slivers in the track list.
 - **Gap detection and filling** — optionally scans the output for *underway gaps*: time breaks longer than `--split-gap` hours where the vessel has also moved (distinguishing passage gaps from in-port layups). For each gap, prints the start/end time, distance, estimated fill speed, and reverse-geocoded landmark names for both endpoints, then prompts whether to fill it with great-circle-interpolated points spaced at `--min-distance`. Use `--fix-gaps-auto` to fill all gaps without prompting.
 - **Waypoint passthrough** — optionally copies all named waypoints from the input to the output
 - **Rich terminal UI** — colour output, animated progress bars, and a summary table; multiple verbosity levels for debugging
@@ -58,6 +60,15 @@ python gpx_simplify.py -i voyage.gpx --fix-gaps
 
 # Automatically fill all underway gaps without prompting:
 python gpx_simplify.py -i voyage.gpx --fix-gaps-auto
+
+# Write each passage leg as its own named track (YYYYMMDD):
+python gpx_simplify.py -i voyage.gpx --split-tracks
+
+# Merge any segment shorter than 20 nm into its neighbour:
+python gpx_simplify.py -i voyage.gpx --merge-short 20
+
+# Both together — named tracks with no stub segments:
+python gpx_simplify.py -i voyage.gpx --split-tracks --merge-short 20
 ```
 
 ## Options
@@ -77,6 +88,8 @@ python gpx_simplify.py -i voyage.gpx --fix-gaps-auto
 | `--split-gap HOURS` | `24` | Split output into separate segments at time gaps longer than this; use 0 to disable |
 | `--zerospd-window N` | `10` | Number of context points to examine on each side when evaluating a zero-speed step |
 | `--zerospd-max-dist KM` | `50` | Distance threshold (km) beyond which a zero-speed pair is treated as a ghost island and dropped |
+| `--split-tracks` | off | Write each segment as its own GPX `<trk>` named `YYYYMMDD` (date of first point) instead of as segments within a single track |
+| `--merge-short NM` | `50` | Merge any segment shorter than this many nautical miles into its chronological predecessor (or successor if it is the first). Set to 0 to disable. |
 | `--fix-gaps` | off | Detect underway gaps and prompt to fill each one interactively |
 | `--fix-gaps-auto` | off | Detect and fill all underway gaps automatically without prompting (implies `--fix-gaps`) |
 | `--waypoints / --no-waypoints` | waypoints on | Copy waypoints to output |
@@ -116,9 +129,11 @@ python gpx_simplify.py -i voyage.gpx --fix-gaps-auto
 
 **10d. Gap detection and filling** *(optional — `--fix-gaps` or `--fix-gaps-auto`)* — walks the processed point list and identifies *underway gaps*: adjacent pairs where the time difference exceeds `--split-gap` hours **and** the vessel has moved (great-circle distance > 0 between the two points). Pure time-only gaps where the boat didn't move (e.g. an extended port call) are skipped — there is nothing to interpolate. For each underway gap, the tool prints the start and end time, duration, distance, estimated fill speed (mean of the 10-point average speed immediately before and after the gap), and a **human-readable location** for each endpoint sourced from the Nominatim reverse-geocoding API (OpenStreetMap) — e.g. `33.8568°S, 151.2153°E  (Sydney, New South Wales, Australia)`. Results are cached by 0.01° grid cell; open-ocean points and network failures fall back gracefully to bare coordinates. In interactive mode (`--fix-gaps`) the user is prompted for each gap; `--fix-gaps-auto` fills all gaps without prompting. Accepted gaps are filled with great-circle-interpolated points at `--min-distance` spacing, with timestamps distributed proportionally to distance. Inserted points are tagged `source="interpolated"`.
 
-**11. Segment splitting** — before writing, splits the flat point list into separate track segments wherever the time gap between consecutive points exceeds `--split-gap` hours (default 24). Single-point segments and 2-point segments with total distance below 10 m are dropped. GPX viewers do not draw a connecting line between separate segments, so the track renders correctly across multi-day or multi-month gaps without straight lines across the ocean.
+**11. Short-segment merging** *(optional — `--merge-short NM`, default 50)* — after segmenting, any segment shorter than the threshold is merged into its chronological predecessor (or into its successor if it is the first segment). The pass repeats until no short segments remain. A solitary segment that is the only one in the file is always left unchanged. Set `--merge-short 0` to disable.
 
-**12. Write** — writes a clean GPX 1.1 file with one track containing multiple segments (one per passage leg) and optional waypoints. The `xsi:schemaLocation` attribute that gpxpy normally includes is stripped from the output — some applications attempt to fetch the referenced XSD from the network on load, which causes a hang if the request is slow or firewalled. Output coordinates are rounded to 6 decimal places (~11 cm precision).
+**12. Segment splitting** *(renamed from 11)* — before writing, splits the flat point list into separate track segments wherever the time gap between consecutive points exceeds `--split-gap` hours (default 24). Single-point segments and 2-point segments with total distance below 10 m are dropped. GPX viewers do not draw a connecting line between separate segments, so the track renders correctly across multi-day or multi-month gaps without straight lines across the ocean.
+
+**13. Write** — writes a clean GPX 1.1 file. In the default mode, all segments are written as segments within a single `<trk>`. With `--split-tracks`, each segment becomes its own `<trk>` named with the date of its first point (`YYYYMMDD`). Optional waypoints are copied through in either mode. The `xsi:schemaLocation` attribute that gpxpy normally includes is stripped from the output — some applications attempt to fetch the referenced XSD from the network on load, which causes a hang if the request is slow or firewalled. Output coordinates are rounded to 6 decimal places (~11 cm precision).
 
 ## Example output
 
